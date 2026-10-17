@@ -177,7 +177,9 @@ export class YouTubeMusicProvider implements MusicProvider {
       );
     }
 
-    await this.loadGisScript();
+    if (!window.google?.accounts?.oauth2) {
+      await this.loadGisScript();
+    }
 
     return new Promise<void>((resolve, reject) => {
       const oauth2 = window.google?.accounts?.oauth2;
@@ -209,8 +211,17 @@ export class YouTubeMusicProvider implements MusicProvider {
         },
       });
 
-      tokenClient.requestAccessToken({ prompt: 'consent' });
+      tokenClient.requestAccessToken({ prompt: 'select_account consent' });
     });
+  }
+
+  public clearAccessTokenOnly(): void {
+    this.accessToken = null;
+    try {
+      sessionStorage.removeItem(STORAGE_KEY_TOKEN);
+    } catch {
+      // Ignore storage errors
+    }
   }
 
   public disconnect(): void {

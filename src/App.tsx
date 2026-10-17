@@ -1,16 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
   Check,
   CheckCircle2,
-  Copy,
   Disc3,
   Ear,
   Flag,
-  Headphones,
   Heart,
-  Link2,
   LogOut,
   Music2,
   Play,
@@ -19,6 +16,7 @@ import {
   Search,
   Send,
   Settings2,
+  Share2,
   Shuffle,
   Sparkles,
   Square,
@@ -48,7 +46,11 @@ import {
   PartyMember,
   selectNextPartyTrack,
 } from './party/partyEngine';
-import { PartyAckPayload, PartyRoomService } from './party/PartyRoomService';
+import {
+  getSavedHostRoomCode,
+  PartyAckPayload,
+  PartyRoomService,
+} from './party/PartyRoomService';
 import {
   SpotifyPlaybackStrategy,
   SpotifyProvider,
@@ -59,20 +61,26 @@ import { YouTubeMusicProvider } from './providers/YouTubeMusicProvider';
 
 type ScreenView = 'quiz' | 'summary';
 type OffsetMode = 'zero' | 'random';
+type GameMode = 'youtube-music' | 'spotify' | 'party';
 
 const MILESTONE_SECONDS = [0.1, 0.5, 1, 2, 5, 10, 15, 30];
 const STORAGE_KEY_PARTY_MEMBERS = 'aurelia.party.members.v1';
-const STORAGE_KEY_PENDING_PARTY_ACTION = 'aurelia.party.pending_action.v1';
-const STORAGE_KEY_GAME_SESSION = 'aurelia.game.session.v1';
+const STORAGE_KEY_PENDING_PARTY_ACTION = 'aurelia.party.pending_action.v2';
+const STORAGE_KEY_GAME_SESSION = 'aurelia.game.session.v2';
+const STORAGE_KEY_SAVED_JOIN_CODE = 'aurelia.party.join_code.v1';
+const STORAGE_KEY_SAVED_PLAYER_NAME = 'aurelia.party.player_name.v1';
 
 interface PendingPartyAction {
   mode: 'local-add' | 'remote-join';
   playerName: string;
   provider: ProviderId;
   roomCode?: string;
+  createdAt: number;
 }
 
 interface PersistedGameSession {
+  gameMode: GameMode;
+  isPartyLobbyOpen: boolean;
   view: ScreenView;
   offsetMode: OffsetMode;
   currentTrack: Track | null;
@@ -100,6 +108,19 @@ function loadSavedGameSession(): PersistedGameSession | null {
   return null;
 }
 
+function loadInitialPartyMembers(): PartyMember[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_PARTY_MEMBERS);
+    if (raw) {
+      const parsed = JSON.parse(raw) as PartyMember[];
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // Ignore
+  }
+  return [];
+}
+
 export function App() {
   const env = useMemo(() => getEnvConfig(), []);
   const savedSession = useMemo(() => loadSavedGameSession(), []);
@@ -118,15 +139,29 @@ export function App() {
     partyRoomRef.current = new PartyRoomService();
   }
 
-  const [activeProviderId, setActiveProviderId] = useState<ProviderId>(() => {
+  // Determine initial GameMode ('youtube-music' | 'spotify' | 'party')
+  const [gameMode, setGameMode] = useState<GameMode>(() => {
     try {
       const params = new URLSearchParams(window.location.search);
+      if (params.has('party')) {
+        return 'party';
+      }
+      const pendingRaw = localStorage.getItem(STORAGE_KEY_PENDING_PARTY_ACTION);
+      if (pendingRaw) {
+        const pending = JSON.parse(pendingRaw) as PendingPartyAction;
+        if (Date.now() - (pending.createdAt ?? 0) < 15 * 60 * 1000) {
+          return 'party';
+        }
+      }
       if (params.has('code') || params.has('error')) {
         return 'spotify';
       }
-      const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_PROVIDER);
-      if (saved === 'spotify' || saved === 'youtube-music') {
-        return saved;
+      if (savedSession?.gameMode) {
+        return savedSession.gameMode;
+      }
+      const savedProvider = localStorage.getItem(STORAGE_KEY_ACTIVE_PROVIDER);
+      if (savedProvider === 'spotify' || savedProvider === 'youtube-music') {
+        return savedProvider;
       }
     } catch {
       // Ignore storage errors
@@ -134,12 +169,13 @@ export function App() {
     return 'youtube-music';
   });
 
+  const activeProviderId: ProviderId = gameMode === 'spotify' ? 'spotify' : 'youtube-music';
+  const activeProvider: MusicProvider =
+    activeProviderId === 'youtube-music' ? ytProviderRef.current : spotifyProviderRef.current;
+
   const [spotifyStrategy, setSpotifyStrategy] = useState<SpotifyPlaybackStrategy>(() =>
     spotifyProviderRef.current!.getPlaybackStrategy()
   );
-
-  const activeProvider: MusicProvider =
-    activeProviderId === 'youtube-music' ? ytProviderRef.current : spotifyProviderRef.current;
 
   const [soloCatalog, setSoloCatalog] = useState<Track[]>(() =>
     activeProvider.getCachedCatalog()
@@ -148,45 +184,11 @@ export function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
-  // Party Mode State
-  const [partyMembers, setPartyMembers] = useState<PartyMember[]>(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY_PARTY_MEMBERS);
-      if (raw) {
-        const parsed = JSON.parse(raw) as PartyMember[];
-        if (Array.isArray(parsed)) return parsed;
-      }
-    } catch {
-      // Ignore
-    }
-    return [];
-  });
-  const [memberPickCounts, setMemberPickCounts] = useState<Record<string, number>>(
-    () => savedSession?.memberPickCounts ?? {}
-  );
-  const [isPartyModalOpen, setIsPartyModalOpen] = useState<boolean>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.has('party');
-  });
-  const [partyTab, setPartyTab] = useState<'host' | 'join'>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.has('party') ? 'join' : 'host';
-  });
-  const [newPlayerName, setNewPlayerName] = useState<string>('');
-  const [newPlayerProvider, setNewPlayerProvider] = useState<ProviderId>('youtube-music');
-  const [hostRoomCode, setHostRoomCode] = useState<string | null>(null);
-  const [isHostingRoom, setIsHostingRoom] = useState<boolean>(false);
-  const [copiedLink, setCopiedLink] = useState<boolean>(false);
-
-  // Remote Join State
-  const [joinRoomCode, setJoinRoomCode] = useState<string>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return (params.get('party') ?? '').toUpperCase();
-  });
-  const [guestAck, setGuestAck] = useState<PartyAckPayload | null>(null);
-
-  // Persist party members
+  // Party Mode State & Synchronous Ref (fixes React 18 async batching in WebRTC/SSE callbacks)
+  const [partyMembers, setPartyMembers] = useState<PartyMember[]>(loadInitialPartyMembers);
+  const partyMembersRef = useRef<PartyMember[]>(partyMembers);
   useEffect(() => {
+    partyMembersRef.current = partyMembers;
     try {
       localStorage.setItem(STORAGE_KEY_PARTY_MEMBERS, JSON.stringify(partyMembers));
     } catch {
@@ -194,13 +196,85 @@ export function App() {
     }
   }, [partyMembers]);
 
-  const mergedPartyPool = useMemo(
-    () => mergePartyCatalogs(partyMembers),
-    [partyMembers]
+  const [memberPickCounts, setMemberPickCounts] = useState<Record<string, number>>(
+    () => savedSession?.memberPickCounts ?? {}
   );
 
-  const isPartyActive = partyMembers.length > 0;
-  const catalog = isPartyActive ? mergedPartyPool.tracks : soloCatalog;
+  const [isPartyLobbyOpen, setIsPartyLobbyOpen] = useState<boolean>(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('party')) return true;
+    if (savedSession && typeof savedSession.isPartyLobbyOpen === 'boolean') {
+      return savedSession.isPartyLobbyOpen;
+    }
+    return true;
+  });
+
+  const [partyTab, setPartyTab] = useState<'host' | 'join'>(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('party')) return 'join';
+    try {
+      const pendingRaw = localStorage.getItem(STORAGE_KEY_PENDING_PARTY_ACTION);
+      if (pendingRaw) {
+        const pending = JSON.parse(pendingRaw) as PendingPartyAction;
+        if (pending.mode === 'remote-join') return 'join';
+      }
+    } catch {
+      // Ignore
+    }
+    return 'host';
+  });
+
+  const [newPlayerName, setNewPlayerName] = useState<string>(() => {
+    try {
+      return localStorage.getItem(STORAGE_KEY_SAVED_PLAYER_NAME) ?? '';
+    } catch {
+      return '';
+    }
+  });
+  const [newPlayerProvider, setNewPlayerProvider] = useState<ProviderId>('youtube-music');
+  const [hostRoomCode, setHostRoomCode] = useState<string | null>(() => getSavedHostRoomCode());
+  const [isPollingRoom, setIsPollingRoom] = useState<boolean>(false);
+  const [copiedLink, setCopiedLink] = useState<boolean>(false);
+
+  // Remote Join State
+  const [joinRoomCode, setJoinRoomCode] = useState<string>(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const fromUrl = params.get('party')?.trim().toUpperCase();
+      if (fromUrl) {
+        localStorage.setItem(STORAGE_KEY_SAVED_JOIN_CODE, fromUrl);
+        return fromUrl;
+      }
+      return localStorage.getItem(STORAGE_KEY_SAVED_JOIN_CODE) ?? '';
+    } catch {
+      return '';
+    }
+  });
+  const [guestAck, setGuestAck] = useState<PartyAckPayload | null>(null);
+
+  const handlePlayerNameChange = (val: string) => {
+    setNewPlayerName(val);
+    try {
+      localStorage.setItem(STORAGE_KEY_SAVED_PLAYER_NAME, val);
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleJoinCodeChange = (val: string) => {
+    const clean = val.toUpperCase().replace(/[^A-Z0-9]/g, '');
+    setJoinRoomCode(clean);
+    try {
+      localStorage.setItem(STORAGE_KEY_SAVED_JOIN_CODE, clean);
+    } catch {
+      // Ignore
+    }
+  };
+
+  const mergedPartyPool = useMemo(() => mergePartyCatalogs(partyMembers), [partyMembers]);
+
+  const isPartyMode = gameMode === 'party';
+  const catalog = isPartyMode ? mergedPartyPool.tracks : soloCatalog;
 
   // Game & Round State (Restored from savedSession on page refresh)
   const [view, setView] = useState<ScreenView>(() => savedSession?.view ?? 'quiz');
@@ -237,6 +311,8 @@ export function App() {
   useEffect(() => {
     try {
       const payload: PersistedGameSession = {
+        gameMode,
+        isPartyLobbyOpen,
         view,
         offsetMode,
         currentTrack,
@@ -254,6 +330,8 @@ export function App() {
       // Ignore storage errors
     }
   }, [
+    gameMode,
+    isPartyLobbyOpen,
     view,
     offsetMode,
     currentTrack,
@@ -272,7 +350,6 @@ export function App() {
   const [selectedSuggestionIdx, setSelectedSuggestionIdx] = useState<number>(0);
   const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
 
-  // Select the right playback provider for any track (supports mixed YT + Spotify party tracks)
   const getPlaybackProviderForTrack = (track: Track): MusicProvider => {
     if (track.videoId || track.provider === 'youtube-music') {
       return ytProviderRef.current!;
@@ -284,85 +361,237 @@ export function App() {
   useEffect(() => {
     if (savedSession?.currentTrack) {
       const provider = getPlaybackProviderForTrack(savedSession.currentTrack);
-      void provider.cueTrack(savedSession.currentTrack).catch(() => {
-        // Ignore cue errors on background restore
-      });
+      void provider.cueTrack(savedSession.currentTrack).catch(() => {});
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const stopAllPlayback = () => {
+  const stopAllPlayback = useCallback(() => {
     ytProviderRef.current?.stopPlayback();
     spotifyProviderRef.current?.stopPlayback();
     setIsPlaying(false);
-  };
+  }, []);
 
-  const switchProvider = (nextProviderId: ProviderId) => {
-    if (nextProviderId === activeProviderId) return;
+  // Cancel the current game & round completely when switching modes
+  const cancelCurrentGame = useCallback(() => {
     stopAllPlayback();
+    setPlaybackElapsedSec(0);
     setErrorMessage(null);
-    setActiveProviderId(nextProviderId);
-    if (!isPartyActive) {
-      setCurrentTrack(null);
-    }
+    setCurrentTrack(null);
+    setStartOffsetSec(0);
+    setSnippetDurationSec(MIN_SNIPPET_SECONDS);
+    setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
+    setGuesses([]);
+    setRoundState('playing');
+    setRoundHistory([]);
+    setUsedTrackIds(new Set());
+    setMemberPickCounts({});
+    setSearchQuery('');
+    setIsDropdownOpen(false);
+    setView('quiz');
     try {
-      localStorage.setItem(STORAGE_KEY_ACTIVE_PROVIDER, nextProviderId);
+      localStorage.removeItem(STORAGE_KEY_GAME_SESSION);
     } catch {
       // Ignore
     }
-  };
+  }, [stopAllPlayback]);
 
-  const handleSpotifyStrategyChange = (nextStrategy: SpotifyPlaybackStrategy) => {
-    spotifyProviderRef.current?.setPlaybackStrategy(nextStrategy);
-    setSpotifyStrategy(nextStrategy);
-    setErrorMessage(null);
-  };
-
-  // Sync solo catalog and theme attribute when switching provider
-  useEffect(() => {
-    document.documentElement.setAttribute('data-provider', activeProviderId);
-    const cached = activeProvider.getCachedCatalog();
-    setSoloCatalog(cached);
-  }, [activeProvider, activeProviderId]);
-
-  const addOrUpdatePartyMember = (
-    name: string,
-    provider: ProviderId,
-    tracks: Track[],
-    explicitId?: string
-  ): PartyMember[] => {
-    const cleanName = name.trim() || `Player ${partyMembers.length + 1}`;
-    let updatedList: PartyMember[] = [];
-    setPartyMembers((prev) => {
-      const existingIdx = prev.findIndex(
+  // Synchronously update partyMembersRef + React state so host callbacks never see stale rosters
+  const addOrUpdatePartyMember = useCallback(
+    (
+      name: string,
+      provider: ProviderId,
+      tracks: Track[],
+      explicitId?: string
+    ): PartyMember[] => {
+      const currentList = partyMembersRef.current;
+      const cleanName = name.trim() || `Player ${currentList.length + 1}`;
+      const existingIdx = currentList.findIndex(
         (m) =>
           (explicitId && m.id === explicitId) ||
           (m.name.toLowerCase() === cleanName.toLowerCase() && m.provider === provider)
       );
+
+      let updatedList: PartyMember[];
       if (existingIdx >= 0) {
-        updatedList = [...prev];
+        updatedList = [...currentList];
         updatedList[existingIdx] = {
           ...updatedList[existingIdx],
           name: cleanName,
           tracks,
         };
-        return updatedList;
+      } else {
+        const color = PARTY_MEMBER_COLORS[currentList.length % PARTY_MEMBER_COLORS.length];
+        updatedList = [
+          ...currentList,
+          {
+            id: explicitId || `member-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            name: cleanName,
+            color,
+            provider,
+            tracks,
+          },
+        ];
       }
-      const color = PARTY_MEMBER_COLORS[prev.length % PARTY_MEMBER_COLORS.length];
-      updatedList = [
-        ...prev,
-        {
-          id: explicitId || `member-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          name: cleanName,
-          color,
-          provider,
-          tracks,
-        },
-      ];
+
+      partyMembersRef.current = updatedList;
+      setPartyMembers(updatedList);
       return updatedList;
-    });
-    return updatedList;
+    },
+    []
+  );
+
+  // Start or resume hosting a live party room
+  const ensureHostingRoom = useCallback(
+    async (forceNewCode = false) => {
+      try {
+        const code = await partyRoomRef.current!.hostRoom(
+          (guestPayload, replyAck) => {
+            const updatedMembers = addOrUpdatePartyMember(
+              guestPayload.name,
+              guestPayload.provider,
+              guestPayload.tracks,
+              guestPayload.memberId
+            );
+            const merged = mergePartyCatalogs(updatedMembers);
+            replyAck({
+              memberCount: updatedMembers.length,
+              sharedMatchesCount: merged.sharedMatchesCount,
+              totalTracksCount: merged.totalUniqueCount,
+            });
+          },
+          undefined,
+          forceNewCode
+        );
+        setHostRoomCode(code);
+      } catch (err) {
+        setErrorMessage(err instanceof Error ? err.message : 'Could not open live party room.');
+      }
+    },
+    [addOrUpdatePartyMember]
+  );
+
+  // Auto-host room whenever in Party Mode (or if a saved host room code exists on reload)
+  useEffect(() => {
+    if (gameMode === 'party' || getSavedHostRoomCode()) {
+      void ensureHostingRoom(false);
+    }
+  }, [gameMode, ensureHostingRoom]);
+
+  const startNewRound = async (pool: Track[] = catalog, forcePartyMode = isPartyMode) => {
+    if (pool.length === 0) return;
+    stopAllPlayback();
+    setPlaybackElapsedSec(0);
+    setErrorMessage(null);
+
+    let chosen: Track;
+    if (forcePartyMode) {
+      const selection = selectNextPartyTrack(
+        pool,
+        usedTrackIds,
+        memberPickCounts,
+        partyMembersRef.current
+      );
+      chosen = selection.chosen;
+      setMemberPickCounts(selection.updatedPickCounts);
+    } else {
+      const unplayed = pool.filter((t) => !usedTrackIds.has(t.id));
+      const candidatePool = unplayed.length > 0 ? unplayed : pool;
+      chosen = candidatePool[Math.floor(Math.random() * candidatePool.length)];
+    }
+
+    setCurrentTrack(chosen);
+    setSnippetDurationSec(MIN_SNIPPET_SECONDS);
+    setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
+    setGuesses([]);
+    setRoundState('playing');
+    setSearchQuery('');
+    setIsDropdownOpen(false);
+
+    try {
+      const playbackProvider = getPlaybackProviderForTrack(chosen);
+      const { durationSec } = await playbackProvider.cueTrack(chosen);
+      if (offsetMode === 'random' && durationSec && durationSec > 45) {
+        const safeMaxStart = Math.max(0, Math.floor(durationSec - 35));
+        setStartOffsetSec(Math.floor(Math.random() * safeMaxStart));
+      } else {
+        setStartOffsetSec(0);
+      }
+    } catch (err) {
+      setStartOffsetSec(0);
+      setErrorMessage(err instanceof Error ? err.message : 'Unable to cue track.');
+    }
   };
+
+  // Switch between YouTube Music, Spotify, and Party Mode — cancels current game immediately
+  const handleSelectMode = (nextMode: GameMode) => {
+    if (nextMode === gameMode) {
+      if (nextMode === 'party' && !isPartyLobbyOpen) {
+        cancelCurrentGame();
+        setIsPartyLobbyOpen(true);
+      }
+      return;
+    }
+
+    cancelCurrentGame();
+    setIsSettingsOpen(false);
+    setGameMode(nextMode);
+
+    if (nextMode === 'party') {
+      setIsPartyLobbyOpen(true);
+      void ensureHostingRoom(false);
+    } else {
+      setIsPartyLobbyOpen(false);
+      try {
+        localStorage.setItem(STORAGE_KEY_ACTIVE_PROVIDER, nextMode);
+      } catch {
+        // Ignore
+      }
+      const nextProvider =
+        nextMode === 'youtube-music' ? ytProviderRef.current! : spotifyProviderRef.current!;
+      const cached = nextProvider.getCachedCatalog();
+      setSoloCatalog(cached);
+      if (cached.length > 0) {
+        void startNewRound(cached, false);
+      }
+    }
+  };
+
+  const handleOffsetModeChange = (nextOffsetMode: OffsetMode) => {
+    if (nextOffsetMode === offsetMode) return;
+    setOffsetMode(nextOffsetMode);
+    cancelCurrentGame();
+    if (catalog.length > 0 && (!isPartyMode || !isPartyLobbyOpen)) {
+      void startNewRound(catalog, isPartyMode);
+    }
+  };
+
+  const handleSpotifyStrategyChange = (nextStrategy: SpotifyPlaybackStrategy) => {
+    if (nextStrategy === spotifyStrategy) return;
+    spotifyProviderRef.current?.setPlaybackStrategy(nextStrategy);
+    setSpotifyStrategy(nextStrategy);
+    cancelCurrentGame();
+    if (catalog.length > 0 && (!isPartyMode || !isPartyLobbyOpen)) {
+      void startNewRound(catalog, isPartyMode);
+    }
+  };
+
+  // Sync theme attribute and solo catalog when mode changes
+  useEffect(() => {
+    document.documentElement.setAttribute('data-provider', gameMode);
+    if (gameMode !== 'party') {
+      const cached = activeProvider.getCachedCatalog();
+      setSoloCatalog(cached);
+    }
+  }, [gameMode, activeProvider]);
+
+  // Auto-start round when solo catalog is ready and no track is active
+  useEffect(() => {
+    if (!isPartyMode && soloCatalog.length > 0 && !currentTrack && view === 'quiz') {
+      void startNewRound(soloCatalog, false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [soloCatalog, isPartyMode]);
 
   // Handle Spotify PKCE OAuth redirect callback (?code=...) on mount
   useEffect(() => {
@@ -396,26 +625,34 @@ export function App() {
         .then(async (tracks) => {
           setSoloCatalog(tracks);
 
-          // Check if this login was triggered from Party Mode
-          const pendingRaw = sessionStorage.getItem(STORAGE_KEY_PENDING_PARTY_ACTION);
+          // Check if this login was triggered from Party Mode (persisted in localStorage for mobile)
+          const pendingRaw = localStorage.getItem(STORAGE_KEY_PENDING_PARTY_ACTION);
           if (pendingRaw) {
-            sessionStorage.removeItem(STORAGE_KEY_PENDING_PARTY_ACTION);
+            localStorage.removeItem(STORAGE_KEY_PENDING_PARTY_ACTION);
             const pending = JSON.parse(pendingRaw) as PendingPartyAction;
-            if (pending.mode === 'local-add') {
-              addOrUpdatePartyMember(pending.playerName, 'spotify', tracks);
-              setIsPartyModalOpen(true);
-            } else if (pending.mode === 'remote-join' && pending.roomCode) {
-              setIsPartyModalOpen(true);
-              setPartyTab('join');
-              const ack = await partyRoomRef.current!.sendCatalogToHost(pending.roomCode, {
-                memberId: `guest-${Date.now()}`,
-                name: pending.playerName,
-                provider: 'spotify',
-                tracks,
-              });
-              setGuestAck(ack);
+            if (Date.now() - (pending.createdAt ?? 0) < 15 * 60 * 1000) {
+              setGameMode('party');
+              setIsPartyLobbyOpen(true);
+              if (pending.mode === 'local-add') {
+                setPartyTab('host');
+                addOrUpdatePartyMember(pending.playerName, 'spotify', tracks);
+              } else if (pending.mode === 'remote-join' && pending.roomCode) {
+                setPartyTab('join');
+                setJoinRoomCode(pending.roomCode);
+                setNewPlayerName(pending.playerName);
+                const ack = await partyRoomRef.current!.sendCatalogToHost(pending.roomCode, {
+                  memberId: `guest-${Date.now()}`,
+                  name: pending.playerName,
+                  provider: 'spotify',
+                  tracks,
+                });
+                setGuestAck(ack);
+              }
+              return;
             }
-          } else if (tracks.length === 0) {
+          }
+
+          if (tracks.length === 0) {
             setErrorMessage('Connected to Spotify, but no Liked Songs were found in your library.');
           }
         })
@@ -444,58 +681,6 @@ export function App() {
     [roundHistory]
   );
 
-  const startNewRound = async (pool: Track[] = catalog) => {
-    if (pool.length === 0) return;
-    stopAllPlayback();
-    setPlaybackElapsedSec(0);
-    setErrorMessage(null);
-
-    let chosen: Track;
-    if (isPartyActive) {
-      const selection = selectNextPartyTrack(
-        pool,
-        usedTrackIds,
-        memberPickCounts,
-        partyMembers
-      );
-      chosen = selection.chosen;
-      setMemberPickCounts(selection.updatedPickCounts);
-    } else {
-      const unplayed = pool.filter((t) => !usedTrackIds.has(t.id));
-      const candidatePool = unplayed.length > 0 ? unplayed : pool;
-      chosen = candidatePool[Math.floor(Math.random() * candidatePool.length)];
-    }
-
-    setCurrentTrack(chosen);
-    setSnippetDurationSec(MIN_SNIPPET_SECONDS);
-    setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
-    setGuesses([]);
-    setRoundState('playing');
-    setSearchQuery('');
-    setIsDropdownOpen(false);
-
-    try {
-      const playbackProvider = getPlaybackProviderForTrack(chosen);
-      const { durationSec } = await playbackProvider.cueTrack(chosen);
-      if (offsetMode === 'random' && durationSec && durationSec > 45) {
-        const safeMaxStart = Math.max(0, Math.floor(durationSec - 35));
-        setStartOffsetSec(Math.floor(Math.random() * safeMaxStart));
-      } else {
-        setStartOffsetSec(0);
-      }
-    } catch (err) {
-      setStartOffsetSec(0);
-      setErrorMessage(err instanceof Error ? err.message : 'Unable to cue track.');
-    }
-  };
-
-  useEffect(() => {
-    if (catalog.length > 0 && !currentTrack && view === 'quiz') {
-      void startNewRound(catalog);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catalog]);
-
   const handleConnectAndSync = async (forceRefresh = false) => {
     setErrorMessage(null);
     setIsLoadingLibrary(true);
@@ -506,8 +691,8 @@ export function App() {
         setErrorMessage(
           'Connected successfully, but no liked songs were found in your library.'
         );
-      } else if (!isPartyActive) {
-        await startNewRound(tracks);
+      } else if (!isPartyMode) {
+        await startNewRound(tracks, false);
       }
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to load library.');
@@ -516,11 +701,20 @@ export function App() {
     }
   };
 
-  // Party Mode: Add a local player on the same device
-  const handleAddPartyPlayer = async () => {
+  // Party Mode: Add a local player on the host's device
+  const handleAddPartyPlayer = async (useCached = false) => {
     const cleanName = newPlayerName.trim() || `Player ${partyMembers.length + 1}`;
     const targetProvider =
       newPlayerProvider === 'youtube-music' ? ytProviderRef.current! : spotifyProviderRef.current!;
+
+    if (useCached) {
+      const cached = targetProvider.getCachedCatalog();
+      if (cached.length > 0) {
+        addOrUpdatePartyMember(cleanName, newPlayerProvider, cached);
+        handlePlayerNameChange('');
+        return;
+      }
+    }
 
     if (!targetProvider.isConfigured()) {
       setErrorMessage(
@@ -534,23 +728,23 @@ export function App() {
 
     try {
       if (newPlayerProvider === 'spotify') {
-        sessionStorage.setItem(
+        localStorage.setItem(
           STORAGE_KEY_PENDING_PARTY_ACTION,
           JSON.stringify({
             mode: 'local-add',
             playerName: cleanName,
             provider: 'spotify',
+            createdAt: Date.now(),
           } satisfies PendingPartyAction)
         );
       } else {
-        // Force fresh account picker for YouTube Music so another user can sign in
-        ytProviderRef.current!.disconnect();
+        ytProviderRef.current!.clearAccessTokenOnly();
       }
 
       const tracks = await targetProvider.fetchLikedTracks(true);
       if (tracks.length > 0) {
         addOrUpdatePartyMember(cleanName, newPlayerProvider, tracks);
-        setNewPlayerName('');
+        handlePlayerNameChange('');
       }
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to add party player.');
@@ -559,70 +753,51 @@ export function App() {
     }
   };
 
-  // Party Mode: Host a live WebRTC Room Code for friends on other devices
-  const handleStartHostingRoom = async () => {
-    setErrorMessage(null);
-    setIsHostingRoom(true);
-    try {
-      const code = await partyRoomRef.current!.hostRoom(
-        (guestPayload, replyAck) => {
-          const updatedMembers = addOrUpdatePartyMember(
-            guestPayload.name,
-            guestPayload.provider,
-            guestPayload.tracks,
-            guestPayload.memberId
-          );
-          const merged = mergePartyCatalogs(updatedMembers);
-          replyAck({
-            memberCount: updatedMembers.length,
-            sharedMatchesCount: merged.sharedMatchesCount,
-            totalTracksCount: merged.totalUniqueCount,
-          });
-        },
-        (err) => setErrorMessage(err.message)
-      );
-      setHostRoomCode(code);
-    } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Could not open live party room.');
-    } finally {
-      setIsHostingRoom(false);
-    }
-  };
-
-  // Party Mode: Remote Guest connects & sends their Spotify/YouTube Music library to Host
-  const handleGuestJoinAndSend = async () => {
-    const cleanName = newPlayerName.trim();
+  // Party Mode: Remote Guest connects & sends their library to Host
+  const handleGuestJoinAndSend = async (useCached = false) => {
     const cleanCode = joinRoomCode.trim().toUpperCase();
-    if (!cleanName) {
-      setErrorMessage('Please enter your display name first.');
+    if (!cleanCode || cleanCode.length < 4) {
+      setErrorMessage('Enter the 5-character Room Code from the host screen.');
       return;
     }
-    if (!cleanCode) {
-      setErrorMessage('Please enter the 5-character Room Code from the host.');
-      return;
-    }
+    const cleanName = newPlayerName.trim() || 'Guest';
 
     const targetProvider =
       newPlayerProvider === 'youtube-music' ? ytProviderRef.current! : spotifyProviderRef.current!;
-
-    if (!targetProvider.isConfigured()) {
-      setErrorMessage(`${targetProvider.displayName} is not configured on this deployment.`);
-      return;
-    }
 
     setErrorMessage(null);
     setGuestAck(null);
     setIsLoadingLibrary(true);
 
     try {
+      if (useCached) {
+        const cached = targetProvider.getCachedCatalog();
+        if (cached.length > 0) {
+          const ack = await partyRoomRef.current!.sendCatalogToHost(cleanCode, {
+            memberId: `guest-${cleanName.toLowerCase()}-${newPlayerProvider}`,
+            name: cleanName,
+            provider: newPlayerProvider,
+            tracks: cached,
+          });
+          setGuestAck(ack);
+          return;
+        }
+      }
+
+      if (!targetProvider.isConfigured()) {
+        setErrorMessage(`${targetProvider.displayName} is not configured on this deployment.`);
+        return;
+      }
+
       if (newPlayerProvider === 'spotify') {
-        sessionStorage.setItem(
+        localStorage.setItem(
           STORAGE_KEY_PENDING_PARTY_ACTION,
           JSON.stringify({
             mode: 'remote-join',
             playerName: cleanName,
             provider: 'spotify',
             roomCode: cleanCode,
+            createdAt: Date.now(),
           } satisfies PendingPartyAction)
         );
       }
@@ -630,7 +805,7 @@ export function App() {
       const tracks = await targetProvider.fetchLikedTracks(true);
       if (tracks.length > 0) {
         const ack = await partyRoomRef.current!.sendCatalogToHost(cleanCode, {
-          memberId: `guest-${Date.now()}`,
+          memberId: `guest-${cleanName.toLowerCase()}-${newPlayerProvider}`,
           name: cleanName,
           provider: newPlayerProvider,
           tracks,
@@ -644,34 +819,58 @@ export function App() {
     }
   };
 
-  const handleCopyInviteLink = () => {
+  const handleShareOrCopyInvite = async () => {
     if (!hostRoomCode) return;
     const inviteUrl = `${window.location.origin}${window.location.pathname}?party=${hostRoomCode}`;
-    void navigator.clipboard.writeText(inviteUrl);
-    setCopiedLink(true);
-    window.setTimeout(() => setCopiedLink(false), 2200);
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'Join my Aurelia Music Quiz Party!',
+          text: `Join my Aurelia Party Room (${hostRoomCode}) with your Spotify or YouTube Music library:`,
+          url: inviteUrl,
+        });
+        return;
+      } catch {
+        // Fallback to clipboard copy if user cancels share sheet
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(inviteUrl);
+      setCopiedLink(true);
+      window.setTimeout(() => setCopiedLink(false), 2200);
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleManualRoomRefresh = async () => {
+    setIsPollingRoom(true);
+    try {
+      await partyRoomRef.current?.pollRoomNow();
+    } finally {
+      window.setTimeout(() => setIsPollingRoom(false), 400);
+    }
   };
 
   const handleRemovePartyMember = (memberId: string) => {
-    setPartyMembers((prev) => prev.filter((m) => m.id !== memberId));
+    const updated = partyMembersRef.current.filter((m) => m.id !== memberId);
+    partyMembersRef.current = updated;
+    setPartyMembers(updated);
   };
 
   const handleClearParty = () => {
-    stopAllPlayback();
-    partyRoomRef.current?.destroy();
-    setHostRoomCode(null);
+    cancelCurrentGame();
+    partyRoomRef.current?.destroy(true);
+    partyMembersRef.current = [];
     setPartyMembers([]);
-    setMemberPickCounts({});
-    setCurrentTrack(null);
+    setIsPartyLobbyOpen(true);
+    void ensureHostingRoom(true);
   };
 
   const handleDisconnect = () => {
-    stopAllPlayback();
+    cancelCurrentGame();
     activeProvider.disconnect();
     setSoloCatalog([]);
-    setCurrentTrack(null);
-    setRoundHistory([]);
-    setUsedTrackIds(new Set());
     setIsSettingsOpen(false);
   };
 
@@ -748,7 +947,7 @@ export function App() {
           (t.channelTitle && t.channelTitle.toLowerCase().includes(q))
         );
       })
-      .slice(0, 7);
+      .slice(0, 6);
   }, [catalog, searchQuery, guesses]);
 
   const submitGuess = (guessedTrack: Track) => {
@@ -824,14 +1023,17 @@ export function App() {
   };
 
   const handleResetRun = () => {
-    setRoundHistory([]);
-    setUsedTrackIds(new Set());
-    setMemberPickCounts({});
-    setView('quiz');
+    cancelCurrentGame();
     if (catalog.length > 0) {
-      void startNewRound(catalog);
+      void startNewRound(catalog, isPartyMode);
     }
   };
+
+  const selectedPartyProviderCachedCount = useMemo(() => {
+    const p =
+      newPlayerProvider === 'youtube-music' ? ytProviderRef.current : spotifyProviderRef.current;
+    return p?.getCachedCatalog().length ?? 0;
+  }, [newPlayerProvider, soloCatalog]);
 
   const ranking = useMemo(() => evaluateRunRanking(roundHistory), [roundHistory]);
   const unlockedPercent = (snippetDurationSec / MAX_SNIPPET_SECONDS) * 100;
@@ -840,429 +1042,117 @@ export function App() {
     : unlockedPercent;
 
   return (
-    <div className="app-shell" data-provider={activeProviderId}>
-      {/* Header */}
+    <div className="app-shell" data-provider={gameMode}>
+      {/* Simplified Mobile-First Top Navigation */}
       <header className="top-nav">
-        <div className="brand-cluster">
+        <div className="nav-bar-top">
           <div className="brand">
             <div className="brand-icon">
-              <Disc3 className={isPlaying ? 'spin-slow' : ''} size={21} />
+              <Disc3 className={isPlaying ? 'spin-slow' : ''} size={19} />
             </div>
             <span className="brand-title">Aurelia</span>
           </div>
 
-          <div className="provider-segmented" role="tablist" aria-label="Music Source">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeProviderId === 'youtube-music'}
-              className={`seg-btn ${activeProviderId === 'youtube-music' ? 'active' : ''}`}
-              onClick={() => switchProvider('youtube-music')}
-            >
-              <Music2 size={14} />
-              <span>YouTube Music</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={activeProviderId === 'spotify'}
-              className={`seg-btn ${activeProviderId === 'spotify' ? 'active' : ''}`}
-              onClick={() => switchProvider('spotify')}
-            >
-              <Sparkles size={14} />
-              <span>Spotify</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="nav-right">
-          <button
-            type="button"
-            className={`btn-party-toggle ${isPartyModalOpen || isPartyActive ? 'active' : ''}`}
-            onClick={() => setIsPartyModalOpen((v) => !v)}
-          >
-            <Users size={15} />
-            <span>Party Mode</span>
-            {isPartyActive && <span className="party-count-pill">{partyMembers.length}</span>}
-          </button>
-
-          {catalog.length > 0 && (
-            <div className="session-scoreboard">
-              <div className="score-chip">
-                <span className="chip-label">Round</span>
-                <span className="chip-val">
-                  {view === 'summary' ? roundHistory.length : roundHistory.length + 1}
-                </span>
+          <div className="nav-right">
+            {catalog.length > 0 && (!isPartyMode || !isPartyLobbyOpen) && (
+              <div className="session-scoreboard">
+                <div className="score-chip">
+                  <span className="chip-label">R{view === 'summary' ? roundHistory.length : roundHistory.length + 1}</span>
+                </div>
+                <div className="score-chip accent">
+                  <Trophy size={13} />
+                  <span className="chip-val">{runningTotalScore.toLocaleString()}</span>
+                </div>
+                {roundHistory.length > 0 && (
+                  <button
+                    type="button"
+                    className="btn-ghost-pill"
+                    onClick={() => setView(view === 'quiz' ? 'summary' : 'quiz')}
+                  >
+                    {view === 'quiz' ? 'End Run' : 'Resume'}
+                  </button>
+                )}
               </div>
-              <div className="score-chip accent">
-                <Trophy size={14} />
-                <span className="chip-val">{runningTotalScore.toLocaleString()}</span>
-              </div>
-              {roundHistory.length > 0 && (
-                <button
-                  type="button"
-                  className="btn-ghost-pill"
-                  onClick={() => setView(view === 'quiz' ? 'summary' : 'quiz')}
-                >
-                  {view === 'quiz' ? 'Finish Run' : 'Resume Quiz'}
-                </button>
-              )}
-            </div>
-          )}
+            )}
 
-          {catalog.length > 0 && (
             <button
               type="button"
               className={`btn-icon-circle ${isSettingsOpen ? 'active' : ''}`}
               onClick={() => setIsSettingsOpen((v) => !v)}
-              aria-label="Library and playback settings"
-              title="Settings & Library"
+              aria-label="Settings"
+              title="Settings"
             >
-              <Settings2 size={18} />
+              <Settings2 size={17} />
             </button>
-          )}
+          </div>
+        </div>
+
+        {/* Unified 3-Mode Selector (Selecting any mode cancels current game) */}
+        <div className="mode-switcher" role="tablist" aria-label="Game Mode">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={gameMode === 'youtube-music'}
+            className={`mode-tab ${gameMode === 'youtube-music' ? 'active' : ''}`}
+            onClick={() => handleSelectMode('youtube-music')}
+          >
+            <Music2 size={14} />
+            <span>YouTube</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={gameMode === 'spotify'}
+            className={`mode-tab ${gameMode === 'spotify' ? 'active' : ''}`}
+            onClick={() => handleSelectMode('spotify')}
+          >
+            <Sparkles size={14} />
+            <span>Spotify</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={gameMode === 'party'}
+            className={`mode-tab ${gameMode === 'party' ? 'active' : ''}`}
+            onClick={() => handleSelectMode('party')}
+          >
+            <Users size={14} />
+            <span>Party</span>
+            {partyMembers.length > 0 && (
+              <span className="party-count-pill">{partyMembers.length}</span>
+            )}
+          </button>
         </div>
       </header>
 
-      {/* PARTY MODE LOBBY / MANAGER PANEL */}
-      {isPartyModalOpen && (
-        <section className="party-drawer" aria-label="Party Mode Lobby">
-          <div className="party-drawer-header">
-            <div>
-              <h3>
-                <Users size={18} /> Party Mode — Multi-User Playlist Merger
-              </h3>
-              <p>
-                Everyone connects either <strong>Spotify</strong> or{' '}
-                <strong>YouTube Music</strong>. Exact song matches across libraries are played
-                first, followed by fair rotation across all players.
-              </p>
-            </div>
-            <button
-              type="button"
-              className="btn-icon-circle"
-              onClick={() => setIsPartyModalOpen(false)}
-              aria-label="Close Party Lobby"
-            >
-              <X size={16} />
-            </button>
-          </div>
-
-          <div className="party-mode-tabs">
-            <button
-              type="button"
-              className={`btn-chip ${partyTab === 'host' ? 'active' : ''}`}
-              onClick={() => setPartyTab('host')}
-            >
-              <Users size={14} />
-              <span>Party Roster & Host Room ({partyMembers.length} Players)</span>
-            </button>
-            <button
-              type="button"
-              className={`btn-chip ${partyTab === 'join' ? 'active' : ''}`}
-              onClick={() => setPartyTab('join')}
-            >
-              <Send size={14} />
-              <span>Join a Friend&apos;s Room Code</span>
-            </button>
-          </div>
-
-          {partyTab === 'host' ? (
-            <div className="party-host-grid">
-              {/* Left Column: Add Player Locally or Host Remote Room */}
-              <div className="party-add-card">
-                <h4>Add Player to This Party</h4>
-                <div className="party-form-row">
-                  <input
-                    type="text"
-                    className="party-text-input"
-                    placeholder="Player Name (e.g. Alex)"
-                    value={newPlayerName}
-                    onChange={(e) => setNewPlayerName(e.target.value)}
-                  />
-                  <div className="provider-segmented">
-                    <button
-                      type="button"
-                      className={`seg-btn ${
-                        newPlayerProvider === 'youtube-music' ? 'active' : ''
-                      }`}
-                      onClick={() => setNewPlayerProvider('youtube-music')}
-                    >
-                      <Music2 size={13} />
-                      <span>YT Music</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
-                      onClick={() => setNewPlayerProvider('spotify')}
-                    >
-                      <Sparkles size={13} />
-                      <span>Spotify</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div className="party-action-buttons">
-                  <button
-                    type="button"
-                    className="btn-primary"
-                    disabled={isLoadingLibrary}
-                    onClick={() => void handleAddPartyPlayer()}
-                  >
-                    <UserPlus size={16} />
-                    <span>
-                      {isLoadingLibrary
-                        ? 'Syncing Library...'
-                        : `Sign In & Add (${
-                            newPlayerProvider === 'youtube-music' ? 'YouTube Music' : 'Spotify'
-                          })`}
-                    </span>
-                  </button>
-
-                  {soloCatalog.length > 0 && (
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      onClick={() => {
-                        addOrUpdatePartyMember(
-                          newPlayerName.trim() || 'Host',
-                          activeProviderId,
-                          soloCatalog
-                        );
-                        setNewPlayerName('');
-                      }}
-                    >
-                      + Add Already Loaded Library ({soloCatalog.length})
-                    </button>
-                  )}
-                </div>
-
-                {/* Remote P2P Room Code Section */}
-                <div className="live-room-box">
-                  <div className="live-room-info">
-                    <strong>Invite Friends on Their Own Devices</strong>
-                    <span>
-                      Generate a live Room Code so friends can join from their phone or laptop.
-                    </span>
-                  </div>
-                  {hostRoomCode ? (
-                    <div className="room-code-banner">
-                      <div className="room-code-badge">
-                        <span className="code-label">ROOM CODE</span>
-                        <span className="code-value">{hostRoomCode}</span>
-                      </div>
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={handleCopyInviteLink}
-                      >
-                        {copiedLink ? <Check size={15} /> : <Copy size={15} />}
-                        <span>{copiedLink ? 'Invite Link Copied!' : 'Copy Invite Link'}</span>
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      disabled={isHostingRoom}
-                      onClick={() => void handleStartHostingRoom()}
-                    >
-                      <Link2 size={15} />
-                      <span>{isHostingRoom ? 'Opening Room...' : 'Create Live Room Code'}</span>
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              {/* Right Column: Active Party Roster & Merge Statistics */}
-              <div className="party-roster-card">
-                <div className="roster-header">
-                  <h4>Merged Party Pool</h4>
-                  {partyMembers.length > 0 && (
-                    <button
-                      type="button"
-                      className="btn-chip danger"
-                      onClick={handleClearParty}
-                    >
-                      <Trash2 size={13} />
-                      <span>Clear Party</span>
-                    </button>
-                  )}
-                </div>
-
-                {partyMembers.length === 0 ? (
-                  <p className="party-empty-hint">
-                    No players added yet. Add 2 or more players via YouTube Music or Spotify to
-                    merge libraries and prioritize shared songs!
-                  </p>
-                ) : (
-                  <>
-                    <div className="party-stats-pills">
-                      <div className="party-stat-box highlight">
-                        <span className="p-stat-num">
-                          {mergedPartyPool.sharedMatchesCount}
-                        </span>
-                        <span className="p-stat-label">Exact Shared Matches (Played First)</span>
-                      </div>
-                      <div className="party-stat-box">
-                        <span className="p-stat-num">
-                          {mergedPartyPool.totalUniqueCount}
-                        </span>
-                        <span className="p-stat-label">Total Unique Songs (Fair Rotation)</span>
-                      </div>
-                    </div>
-
-                    <div className="member-list">
-                      {partyMembers.map((member) => (
-                        <div key={member.id} className="member-row">
-                          <span
-                            className="member-dot"
-                            style={{ backgroundColor: member.color }}
-                          />
-                          <div className="member-info">
-                            <strong>{member.name}</strong>
-                            <span>
-                              {member.provider === 'youtube-music' ? 'YouTube Music' : 'Spotify'} ·{' '}
-                              {member.tracks.length} songs · Picked{' '}
-                              {memberPickCounts[member.id] ?? 0}×
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            className="member-remove"
-                            onClick={() => handleRemovePartyMember(member.id)}
-                            title="Remove player from party"
-                          >
-                            <X size={15} />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-
-                    <div className="party-start-footer">
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        onClick={() => {
-                          setIsPartyModalOpen(false);
-                          void startNewRound(mergedPartyPool.tracks);
-                        }}
-                      >
-                        <Play size={16} />
-                        <span>Start Party Quiz ({mergedPartyPool.totalUniqueCount} Songs)</span>
-                      </button>
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-          ) : (
-            /* Remote Guest Join Tab */
-            <div className="party-join-panel">
-              <h4>Join a Friend&apos;s Party Room</h4>
-              <p>
-                Enter the 5-character Room Code displayed on the host&apos;s screen, choose your
-                streaming service, and beam your Liked Songs into the party pool.
-              </p>
-
-              <div className="party-form-row">
-                <input
-                  type="text"
-                  maxLength={8}
-                  className="party-text-input code-input"
-                  placeholder="ROOM CODE (e.g. K7M9P)"
-                  value={joinRoomCode}
-                  onChange={(e) => setJoinRoomCode(e.target.value.toUpperCase())}
-                />
-                <input
-                  type="text"
-                  className="party-text-input"
-                  placeholder="Your Display Name"
-                  value={newPlayerName}
-                  onChange={(e) => setNewPlayerName(e.target.value)}
-                />
-                <div className="provider-segmented">
-                  <button
-                    type="button"
-                    className={`seg-btn ${
-                      newPlayerProvider === 'youtube-music' ? 'active' : ''
-                    }`}
-                    onClick={() => setNewPlayerProvider('youtube-music')}
-                  >
-                    <Music2 size={13} />
-                    <span>YouTube Music</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
-                    onClick={() => setNewPlayerProvider('spotify')}
-                  >
-                    <Sparkles size={13} />
-                    <span>Spotify</span>
-                  </button>
-                </div>
-              </div>
-
-              <button
-                type="button"
-                className="btn-primary"
-                disabled={isLoadingLibrary}
-                onClick={() => void handleGuestJoinAndSend()}
-              >
-                <Send size={16} />
-                <span>
-                  {isLoadingLibrary
-                    ? 'Connecting & Sending Library...'
-                    : `Sign In with ${
-                        newPlayerProvider === 'youtube-music' ? 'YouTube Music' : 'Spotify'
-                      } & Join Room`}
-                </span>
-              </button>
-
-              {guestAck && (
-                <div className="guest-ack-banner">
-                  <CheckCircle2 size={18} />
-                  <span>
-                    Synced to Room <strong>{guestAck.roomCode}</strong>! Party now has{' '}
-                    <strong>{guestAck.memberCount} players</strong>,{' '}
-                    <strong>{guestAck.sharedMatchesCount} exact shared matches</strong>, and{' '}
-                    <strong>{guestAck.totalTracksCount} total songs</strong>.
-                  </span>
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-      )}
-
-      {/* Collapsible Settings Popover */}
-      {isSettingsOpen && catalog.length > 0 && (
+      {/* Collapsible Settings Drawer */}
+      {isSettingsOpen && (
         <section className="settings-drawer" aria-label="Quiz settings">
           <div className="settings-row">
             <div className="settings-group">
-              <span className="settings-title">Snippet Start Point</span>
+              <span className="settings-title">Snippet Start</span>
               <div className="pill-toggle-group">
                 <button
                   type="button"
                   className={`btn-chip ${offsetMode === 'zero' ? 'active' : ''}`}
-                  onClick={() => setOffsetMode('zero')}
+                  onClick={() => handleOffsetModeChange('zero')}
                 >
-                  Beginning (0:00)
+                  0:00 Start
                 </button>
                 <button
                   type="button"
                   className={`btn-chip ${offsetMode === 'random' ? 'active' : ''}`}
-                  onClick={() => setOffsetMode('random')}
+                  onClick={() => handleOffsetModeChange('random')}
                 >
                   <Shuffle size={13} />
-                  <span>Random Offset</span>
+                  <span>Random</span>
                 </button>
               </div>
             </div>
 
-            {activeProviderId === 'spotify' && (
+            {gameMode === 'spotify' && (
               <div className="settings-group">
-                <span className="settings-title">Spotify Audio Engine</span>
+                <span className="settings-title">Spotify Audio</span>
                 <div className="pill-toggle-group">
                   <button
                     type="button"
@@ -1271,7 +1161,7 @@ export function App() {
                     }`}
                     onClick={() => handleSpotifyStrategyChange('youtube-iframe-fallback')}
                   >
-                    YouTube Match (Free/Premium)
+                    YouTube Match
                   </button>
                   <button
                     type="button"
@@ -1280,30 +1170,32 @@ export function App() {
                     }`}
                     onClick={() => handleSpotifyStrategyChange('web-playback-sdk')}
                   >
-                    Spotify SDK (Premium)
+                    Spotify SDK
                   </button>
                 </div>
               </div>
             )}
 
-            <div className="settings-group">
-              <span className="settings-title">Library ({catalog.length} songs cached)</span>
-              <div className="pill-toggle-group">
-                <button
-                  type="button"
-                  className="btn-chip"
-                  onClick={() => void handleConnectAndSync(true)}
-                  disabled={isLoadingLibrary}
-                >
-                  <RefreshCw className={isLoadingLibrary ? 'spin' : ''} size={13} />
-                  <span>Re-sync Library</span>
-                </button>
-                <button type="button" className="btn-chip danger" onClick={handleDisconnect}>
-                  <LogOut size={13} />
-                  <span>Disconnect</span>
-                </button>
+            {!isPartyMode && soloCatalog.length > 0 && (
+              <div className="settings-group">
+                <span className="settings-title">Library ({soloCatalog.length})</span>
+                <div className="pill-toggle-group">
+                  <button
+                    type="button"
+                    className="btn-chip"
+                    onClick={() => void handleConnectAndSync(true)}
+                    disabled={isLoadingLibrary}
+                  >
+                    <RefreshCw className={isLoadingLibrary ? 'spin' : ''} size={13} />
+                    <span>Re-sync</span>
+                  </button>
+                  <button type="button" className="btn-chip danger" onClick={handleDisconnect}>
+                    <LogOut size={13} />
+                    <span>Disconnect</span>
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </section>
       )}
@@ -1311,7 +1203,7 @@ export function App() {
       <main className="main-stage">
         {errorMessage && (
           <div className="error-toast" role="alert">
-            <AlertCircle size={17} />
+            <AlertCircle size={16} />
             <span>{errorMessage}</span>
             <button
               type="button"
@@ -1324,107 +1216,346 @@ export function App() {
           </div>
         )}
 
-        {/* ONBOARDING VIEW */}
-        {catalog.length === 0 ? (
-          <section className="surface-card onboarding-view">
-            <div className="hero-badge">
-              <Headphones size={16} />
-              <span>Your Personal Streaming Library Quiz</span>
-            </div>
-            <h2>How well do you know your own Liked Songs?</h2>
-            <p className="onboarding-lead">
-              Connect your <strong>{activeProvider.displayName}</strong> library for solo play, or
-              open <strong>Party Mode</strong> to merge playlists across Spotify and YouTube Music.
-            </p>
-
-            <div className="steps-showcase">
-              <div className="step-card">
-                <div className="step-num">1</div>
-                <strong>Listen to 0.1s</strong>
-                <span>Start with a tiny audio spark worth the maximum 10,000 pts.</span>
-              </div>
-              <div className="step-card">
-                <div className="step-num">2</div>
-                <strong>Scrub up to 30s</strong>
-                <span>Need more melody? Drag the slider or tap a milestone to unlock audio.</span>
-              </div>
-              <div className="step-card">
-                <div className="step-num">3</div>
-                <strong>Solo or Party Mode</strong>
-                <span>
-                  Merge friends&apos; Spotify & YouTube Music libraries—shared matches play first!
-                </span>
-              </div>
+        {/* 1. PARTY MODE LOBBY VIEW */}
+        {isPartyMode && (isPartyLobbyOpen || catalog.length === 0) ? (
+          <section className="surface-card party-lobby-card" aria-label="Party Mode Lobby">
+            <div className="party-mode-tabs">
+              <button
+                type="button"
+                className={`party-tab-btn ${partyTab === 'host' ? 'active' : ''}`}
+                onClick={() => setPartyTab('host')}
+              >
+                <Users size={15} />
+                <span>Host Party ({partyMembers.length})</span>
+              </button>
+              <button
+                type="button"
+                className={`party-tab-btn ${partyTab === 'join' ? 'active' : ''}`}
+                onClick={() => setPartyTab('join')}
+              >
+                <Send size={15} />
+                <span>Join Room Code</span>
+              </button>
             </div>
 
-            {activeProviderId === 'spotify' && (
-              <div className="onboarding-engine-choice">
-                <span className="engine-label">Playback Mode:</span>
-                <button
-                  type="button"
-                  className={`btn-chip ${
-                    spotifyStrategy === 'youtube-iframe-fallback' ? 'active' : ''
-                  }`}
-                  onClick={() => handleSpotifyStrategyChange('youtube-iframe-fallback')}
-                >
-                  YouTube Audio Match (Works on all accounts)
-                </button>
-                <button
-                  type="button"
-                  className={`btn-chip ${
-                    spotifyStrategy === 'web-playback-sdk' ? 'active' : ''
-                  }`}
-                  onClick={() => handleSpotifyStrategyChange('web-playback-sdk')}
-                >
-                  Spotify Premium SDK
-                </button>
-              </div>
-            )}
+            {partyTab === 'host' ? (
+              <div className="party-host-stack">
+                {/* Auto-Hosted Room Code Banner */}
+                <div className="room-code-banner">
+                  <div className="room-code-badge">
+                    <span className="code-label">LIVE ROOM CODE (SHARE WITH FRIENDS)</span>
+                    <div className="code-value-row">
+                      <span className="code-value">{hostRoomCode ?? '...'}</span>
+                      <button
+                        type="button"
+                        className="btn-icon-mini"
+                        onClick={() => void handleManualRoomRefresh()}
+                        title="Check for joined players now"
+                        aria-label="Check for joined players"
+                      >
+                        <RefreshCw className={isPollingRoom ? 'spin' : ''} size={14} />
+                      </button>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-share-invite"
+                    disabled={!hostRoomCode}
+                    onClick={() => void handleShareOrCopyInvite()}
+                  >
+                    {copiedLink ? <Check size={15} /> : <Share2 size={15} />}
+                    <span>{copiedLink ? 'Link Copied!' : 'Share Invite Link'}</span>
+                  </button>
+                </div>
 
-            <div className="cta-stack">
-              <div className="onboarding-btn-row">
-                <button
-                  type="button"
-                  className="btn-cta-connect"
-                  disabled={!activeProvider.isConfigured() || isLoadingLibrary}
-                  onClick={() => void handleConnectAndSync(true)}
-                >
-                  {isLoadingLibrary ? (
-                    <>
-                      <RefreshCw className="spin" size={20} />
-                      <span>Loading Your Liked Songs...</span>
-                    </>
+                {/* Add Player on This Device */}
+                <div className="party-add-card">
+                  <span className="section-label">Add Player on This Device</span>
+                  <div className="party-form-row">
+                    <input
+                      type="text"
+                      className="party-text-input"
+                      placeholder="Player Name"
+                      value={newPlayerName}
+                      onChange={(e) => handlePlayerNameChange(e.target.value)}
+                    />
+                    <div className="provider-segmented">
+                      <button
+                        type="button"
+                        className={`seg-btn ${
+                          newPlayerProvider === 'youtube-music' ? 'active' : ''
+                        }`}
+                        onClick={() => setNewPlayerProvider('youtube-music')}
+                      >
+                        <Music2 size={13} />
+                        <span>YouTube</span>
+                      </button>
+                      <button
+                        type="button"
+                        className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
+                        onClick={() => setNewPlayerProvider('spotify')}
+                      >
+                        <Sparkles size={13} />
+                        <span>Spotify</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="party-btn-row">
+                    {selectedPartyProviderCachedCount > 0 && (
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => void handleAddPartyPlayer(true)}
+                      >
+                        + Add Saved ({selectedPartyProviderCachedCount} songs)
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      disabled={isLoadingLibrary}
+                      onClick={() => void handleAddPartyPlayer(false)}
+                    >
+                      <UserPlus size={15} />
+                      <span>
+                        {isLoadingLibrary
+                          ? 'Syncing...'
+                          : `Sign In (${
+                              newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
+                            })`}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Roster & Start Party Quiz */}
+                <div className="party-roster-card">
+                  <div className="roster-header">
+                    <span className="section-label">
+                      Joined Players ({partyMembers.length})
+                    </span>
+                    {partyMembers.length > 0 && (
+                      <button
+                        type="button"
+                        className="btn-chip danger"
+                        onClick={handleClearParty}
+                      >
+                        <Trash2 size={13} />
+                        <span>Reset Room</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {partyMembers.length === 0 ? (
+                    <p className="party-empty-hint">
+                      Share the Room Code above with friends on their phones, or add players here.
+                      Shared songs play first!
+                    </p>
                   ) : (
                     <>
-                      <Play size={20} />
-                      <span>Connect {activeProvider.displayName} & Play</span>
+                      <div className="party-stats-pills">
+                        <div className="party-stat-box highlight">
+                          <span className="p-stat-num">{mergedPartyPool.sharedMatchesCount}</span>
+                          <span className="p-stat-label">Shared Matches</span>
+                        </div>
+                        <div className="party-stat-box">
+                          <span className="p-stat-num">{mergedPartyPool.totalUniqueCount}</span>
+                          <span className="p-stat-label">Total Unique Songs</span>
+                        </div>
+                      </div>
+
+                      <div className="member-list">
+                        {partyMembers.map((member) => (
+                          <div key={member.id} className="member-row">
+                            <span
+                              className="member-dot"
+                              style={{ backgroundColor: member.color }}
+                            />
+                            <div className="member-info">
+                              <strong>{member.name}</strong>
+                              <span>
+                                {member.provider === 'youtube-music' ? 'YouTube' : 'Spotify'} ·{' '}
+                                {member.tracks.length} songs
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              className="member-remove"
+                              onClick={() => handleRemovePartyMember(member.id)}
+                              aria-label={`Remove ${member.name}`}
+                            >
+                              <X size={15} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+
+                      <button
+                        type="button"
+                        className="btn-primary btn-full-width"
+                        onClick={() => {
+                          cancelCurrentGame();
+                          setIsPartyLobbyOpen(false);
+                          void startNewRound(mergedPartyPool.tracks, true);
+                        }}
+                      >
+                        <Play size={16} />
+                        <span>Start Party Quiz ({mergedPartyPool.totalUniqueCount} Songs)</span>
+                      </button>
                     </>
                   )}
-                </button>
-
-                <button
-                  type="button"
-                  className="btn-secondary btn-cta-party"
-                  onClick={() => setIsPartyModalOpen(true)}
-                >
-                  <Users size={19} />
-                  <span>Start / Join Party Mode</span>
-                </button>
+                </div>
               </div>
+            ) : (
+              /* Remote Guest Join Tab (Mobile-Optimized) */
+              <div className="party-join-panel">
+                <p className="join-lead">
+                  Enter the host&apos;s 5-character Room Code and connect your music library to add
+                  your songs to the party.
+                </p>
+
+                <div className="join-fields-stack">
+                  <div className="join-inputs-row">
+                    <input
+                      type="text"
+                      maxLength={6}
+                      className="party-text-input code-input"
+                      placeholder="CODE"
+                      value={joinRoomCode}
+                      onChange={(e) => handleJoinCodeChange(e.target.value)}
+                    />
+                    <input
+                      type="text"
+                      className="party-text-input"
+                      placeholder="Your Name"
+                      value={newPlayerName}
+                      onChange={(e) => handlePlayerNameChange(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="provider-segmented full-width">
+                    <button
+                      type="button"
+                      className={`seg-btn ${
+                        newPlayerProvider === 'youtube-music' ? 'active' : ''
+                      }`}
+                      onClick={() => setNewPlayerProvider('youtube-music')}
+                    >
+                      <Music2 size={14} />
+                      <span>YouTube Music</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
+                      onClick={() => setNewPlayerProvider('spotify')}
+                    >
+                      <Sparkles size={14} />
+                      <span>Spotify</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="party-btn-row">
+                  {selectedPartyProviderCachedCount > 0 && (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      disabled={isLoadingLibrary}
+                      onClick={() => void handleGuestJoinAndSend(true)}
+                    >
+                      <Send size={15} />
+                      <span>Send Saved ({selectedPartyProviderCachedCount} songs)</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    disabled={isLoadingLibrary}
+                    onClick={() => void handleGuestJoinAndSend(false)}
+                  >
+                    <Send size={15} />
+                    <span>
+                      {isLoadingLibrary
+                        ? 'Connecting & Sending...'
+                        : `Sign In & Send (${
+                            newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
+                          })`}
+                    </span>
+                  </button>
+                </div>
+
+                {guestAck && (
+                  <div className="guest-ack-banner">
+                    <CheckCircle2 size={18} />
+                    <span>
+                      Sent to Room <strong>{guestAck.roomCode}</strong>!{' '}
+                      {guestAck.memberCount > 1 ? (
+                        <>
+                          Party now has <strong>{guestAck.memberCount} players</strong> (
+                          <strong>{guestAck.sharedMatchesCount} shared</strong> ·{' '}
+                          <strong>{guestAck.totalTracksCount} total songs</strong>).
+                        </>
+                      ) : (
+                        <>Your songs are now synced with the host!</>
+                      )}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        ) : catalog.length === 0 ? (
+          /* 2. SIMPLIFIED SOLO ONBOARDING VIEW */
+          <section className="surface-card onboarding-view">
+            <div className="hero-badge">
+              {activeProviderId === 'youtube-music' ? (
+                <Music2 size={14} />
+              ) : (
+                <Sparkles size={14} />
+              )}
+              <span>{activeProvider.displayName} Quiz</span>
+            </div>
+            <h2>Guess your own Liked Songs from 0.1s</h2>
+            <p className="onboarding-lead">
+              Unlock longer audio clips if you need a hint—the faster you identify the track, the
+              higher your score.
+            </p>
+
+            <div className="cta-stack">
+              <button
+                type="button"
+                className="btn-cta-connect"
+                disabled={!activeProvider.isConfigured() || isLoadingLibrary}
+                onClick={() => void handleConnectAndSync(true)}
+              >
+                {isLoadingLibrary ? (
+                  <>
+                    <RefreshCw className="spin" size={19} />
+                    <span>Loading Liked Songs...</span>
+                  </>
+                ) : (
+                  <>
+                    <Play size={19} />
+                    <span>Connect {activeProvider.displayName}</span>
+                  </>
+                )}
+              </button>
 
               {!activeProvider.isConfigured() && (
                 <div className="setup-hint-box">
-                  <AlertCircle size={16} />
+                  <AlertCircle size={15} />
                   <span>
                     {activeProviderId === 'youtube-music' ? (
                       <>
-                        Add <code>VITE_GOOGLE_CLIENT_ID</code> and <code>VITE_GOOGLE_API_KEY</code>{' '}
-                        to <code>.env.local</code> to enable YouTube Music login.
+                        Configure <code>VITE_GOOGLE_CLIENT_ID</code> and{' '}
+                        <code>VITE_GOOGLE_API_KEY</code> in <code>.env.local</code>.
                       </>
                     ) : (
                       <>
-                        Add <code>VITE_SPOTIFY_CLIENT_ID</code> to <code>.env.local</code> (Redirect
-                        URI: <code>{env.spotify.redirectUri}</code>) to enable Spotify login.
+                        Configure <code>VITE_SPOTIFY_CLIENT_ID</code> in <code>.env.local</code>{' '}
+                        (Redirect: <code>{env.spotify.redirectUri}</code>).
                       </>
                     )}
                   </span>
@@ -1433,7 +1564,7 @@ export function App() {
             </div>
           </section>
         ) : view === 'summary' ? (
-          /* SUMMARY / END-OF-RUN RANKING VIEW */
+          /* 3. SUMMARY / END-OF-RUN RANKING VIEW */
           <section className="surface-card summary-view">
             <div className="summary-hero">
               <div className={`rank-crest tier-${ranking.tier.replace('+', 'plus').toLowerCase()}`}>
@@ -1463,7 +1594,7 @@ export function App() {
                 <span className="tile-value">{ranking.winRatePercent}%</span>
               </div>
               <div className="stat-tile">
-                <span className="tile-label">Avg Time Needed</span>
+                <span className="tile-label">Avg Time</span>
                 <span className="tile-value">{ranking.averageDurationSec}s</span>
               </div>
             </div>
@@ -1478,7 +1609,7 @@ export function App() {
                       <img src={item.targetTrack.artworkUrl} alt="" className="history-art" />
                     ) : (
                       <div className="history-art-placeholder">
-                        <Music2 size={16} />
+                        <Music2 size={15} />
                       </div>
                     )}
                     <div className="history-song">
@@ -1501,11 +1632,6 @@ export function App() {
                     </div>
                     <div className="history-badges">
                       <span className="tag-duration">{item.unlockedDurationSec.toFixed(1)}s</span>
-                      {item.wrongGuesses > 0 && (
-                        <span className="tag-penalty">
-                          -{item.wrongGuesses * WRONG_GUESS_PENALTY}
-                        </span>
-                      )}
                       <span className={`tag-points ${item.status}`}>
                         {item.status === 'won'
                           ? `+${item.pointsAwarded.toLocaleString()}`
@@ -1519,16 +1645,16 @@ export function App() {
 
             <div className="summary-actions">
               <button type="button" className="btn-secondary" onClick={() => setView('quiz')}>
-                Keep Playing Run
+                Keep Playing
               </button>
               <button type="button" className="btn-primary" onClick={handleResetRun}>
-                <RotateCcw size={16} />
-                <span>Start New Run</span>
+                <RotateCcw size={15} />
+                <span>New Run</span>
               </button>
             </div>
           </section>
         ) : (
-          /* ACTIVE QUIZ VIEW */
+          /* 4. ACTIVE QUIZ VIEW */
           <section
             className={`surface-card quiz-stage ${
               roundState !== 'playing' ? `result-focused ${roundState}` : ''
@@ -1536,12 +1662,12 @@ export function App() {
           >
             <ConfettiCanvas active={roundState === 'won'} />
 
-            {isPartyActive && roundState === 'playing' && (
+            {isPartyMode && (
               <div className="party-active-bar">
                 <div className="party-roster-chips">
                   <span className="party-bar-label">
-                    <Users size={13} /> Party Pool ({mergedPartyPool.sharedMatchesCount} shared ·{' '}
-                    {mergedPartyPool.totalUniqueCount} total):
+                    <Users size={13} /> {mergedPartyPool.sharedMatchesCount} shared ·{' '}
+                    {mergedPartyPool.totalUniqueCount} songs
                   </span>
                   {partyMembers.map((m) => (
                     <span key={m.id} className="fav-mini-pill" style={{ borderColor: m.color }}>
@@ -1550,12 +1676,22 @@ export function App() {
                     </span>
                   ))}
                 </div>
+                <button
+                  type="button"
+                  className="btn-party-lobby-link"
+                  onClick={() => {
+                    cancelCurrentGame();
+                    setIsPartyLobbyOpen(true);
+                  }}
+                >
+                  Lobby {hostRoomCode ? `(${hostRoomCode})` : ''}
+                </button>
               </div>
             )}
 
             {roundState === 'playing' ? (
               <>
-                {/* Top Status Row: Potential Points & Snippet Badge */}
+                {/* Compact Status Header */}
                 <div className="stage-header">
                   <div className="potential-score-box">
                     <span className="stage-eyebrow">Points at Stake</span>
@@ -1563,29 +1699,26 @@ export function App() {
                       <span className="points-value">{potentialNetPoints.toLocaleString()}</span>
                       <span className="points-unit">pts</span>
                       {wrongGuessesCount > 0 && (
-                        <span
-                          className="penalty-badge"
-                          title={`${wrongGuessesCount} wrong guess(es)`}
-                        >
-                          −{(wrongGuessesCount * WRONG_GUESS_PENALTY).toLocaleString()} penalty
+                        <span className="penalty-badge">
+                          −{(wrongGuessesCount * WRONG_GUESS_PENALTY).toLocaleString()}
                         </span>
                       )}
                     </div>
                   </div>
 
                   <div className="snippet-length-box">
-                    <span className="stage-eyebrow">Unlocked Audio</span>
+                    <span className="stage-eyebrow">Clip Length</span>
                     <div className="length-display-row">
-                      <Ear size={18} className="ear-icon" />
+                      <Ear size={16} className="ear-icon" />
                       <span className="length-value">{snippetDurationSec.toFixed(1)}s</span>
                       <span className="length-max">/ 30s</span>
                     </div>
                   </div>
                 </div>
 
-                {/* Central Audio Player & Interactive Timeline Scrubber */}
+                {/* Compact Mobile-Friendly Player Deck */}
                 <div className={`player-deck ${isPlaying ? 'is-playing' : ''}`}>
-                  <div className="player-main-row">
+                  <div className="player-top-row">
                     <button
                       type="button"
                       className={`hero-play-btn ${isPlaying ? 'playing' : ''}`}
@@ -1594,30 +1727,29 @@ export function App() {
                       aria-label={isPlaying ? 'Stop playback' : 'Play snippet'}
                     >
                       {isPlaying ? (
-                        <Square size={26} />
+                        <Square size={22} />
                       ) : (
-                        <Play size={28} className="play-offset" />
+                        <Play size={24} className="play-offset" />
                       )}
                     </button>
 
-                    <div className="timeline-column">
+                    <div className="scrubber-column">
                       <div className="timeline-status-row">
                         <span className="status-text">
                           {isPlaying ? (
                             <>
-                              <Volume2 size={15} className="pulse-icon" /> Playing snippet (
-                              {playbackElapsedSec.toFixed(1)}s / {snippetDurationSec.toFixed(1)}s)
+                              <Volume2 size={14} className="pulse-icon" />{' '}
+                              {playbackElapsedSec.toFixed(1)}s / {snippetDurationSec.toFixed(1)}s
                             </>
                           ) : (
-                            <>Drag slider or tap a milestone to unlock more of the song</>
+                            <>Slide or tap a milestone below</>
                           )}
                         </span>
                         <span className="curve-hint">
-                          Base: {baseCurvePoints.toLocaleString()} pts
+                          {baseCurvePoints.toLocaleString()} base
                         </span>
                       </div>
 
-                      {/* Custom Visual Progress + Scrubber */}
                       <div className="scrubber-track-wrapper">
                         <div className="scrubber-rail">
                           <div
@@ -1642,28 +1774,27 @@ export function App() {
                           aria-label="Snippet duration in seconds"
                         />
                       </div>
-
-                      {/* Clickable Milestone Pills */}
-                      <div className="milestone-bar">
-                        {MILESTONE_SECONDS.map((sec) => {
-                          const isActive = Math.abs(snippetDurationSec - sec) < 0.05;
-                          const isUnlocked = sec <= maxUnlockedDurationSec;
-                          return (
-                            <button
-                              key={sec}
-                              type="button"
-                              className={`milestone-pill ${isActive ? 'current' : ''} ${
-                                isUnlocked ? 'unlocked' : ''
-                              }`}
-                              onClick={() => handleScrubberChange(sec, true)}
-                              title={`Set snippet to ${sec}s (${calculateLogarithmicBaseScore(sec).toLocaleString()} base pts) and play`}
-                            >
-                              {sec}s
-                            </button>
-                          );
-                        })}
-                      </div>
                     </div>
+                  </div>
+
+                  {/* 8 Milestone Pills (4x2 grid on mobile, single row on desktop) */}
+                  <div className="milestone-bar">
+                    {MILESTONE_SECONDS.map((sec) => {
+                      const isActive = Math.abs(snippetDurationSec - sec) < 0.05;
+                      const isUnlocked = sec <= maxUnlockedDurationSec;
+                      return (
+                        <button
+                          key={sec}
+                          type="button"
+                          className={`milestone-pill ${isActive ? 'current' : ''} ${
+                            isUnlocked ? 'unlocked' : ''
+                          }`}
+                          onClick={() => handleScrubberChange(sec, true)}
+                        >
+                          {sec}s
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
 
@@ -1671,14 +1802,12 @@ export function App() {
                 <div className="guess-zone">
                   <div className="search-bar-container">
                     <div className="search-field-box">
-                      <Search className="search-icon" size={19} />
+                      <Search className="search-icon" size={18} />
                       <input
                         ref={searchInputRef}
                         type="text"
                         className="search-input"
-                        placeholder={`Search ${catalog.length} songs in ${
-                          isPartyActive ? 'the merged Party pool' : `your ${activeProvider.displayName} library`
-                        }...`}
+                        placeholder={`Search ${catalog.length} songs...`}
                         value={searchQuery}
                         onFocus={() => setIsDropdownOpen(true)}
                         onChange={(e) => {
@@ -1725,10 +1854,10 @@ export function App() {
                       type="button"
                       className="btn-skip-round"
                       onClick={handleGiveUp}
-                      title="Reveal the song and move to the next round"
+                      title="Skip and reveal song"
                     >
-                      <Flag size={15} />
-                      <span>Give Up</span>
+                      <Flag size={14} />
+                      <span>Skip</span>
                     </button>
                   </div>
 
@@ -1755,20 +1884,18 @@ export function App() {
                               <img src={track.artworkUrl} alt="" className="suggestion-art" />
                             ) : (
                               <div className="suggestion-art-fallback">
-                                <Music2 size={15} />
+                                <Music2 size={14} />
                               </div>
                             )}
                             <div className="suggestion-text">
                               <span className="suggestion-title">{track.title}</span>
                               <span className="suggestion-artist">{track.artist}</span>
                             </div>
-                            <span className="suggestion-submit-hint">Guess ↵</span>
+                            <span className="suggestion-submit-hint">Guess</span>
                           </button>
                         ))
                       ) : (
-                        <div className="suggestions-empty">
-                          No matching tracks found in the library pool.
-                        </div>
+                        <div className="suggestions-empty">No matching songs found.</div>
                       )}
                     </div>
                   )}
@@ -1781,13 +1908,13 @@ export function App() {
                   <div className="spotlight-badge-row">
                     {roundState === 'won' ? (
                       <span className="spotlight-status won">
-                        <CheckCircle2 size={17} />
-                        <span>Identified in {effectiveScoringDuration.toFixed(1)}s!</span>
+                        <CheckCircle2 size={16} />
+                        <span>Got it in {effectiveScoringDuration.toFixed(1)}s!</span>
                       </span>
                     ) : (
                       <span className="spotlight-status gave-up">
-                        <XCircle size={17} />
-                        <span>Round Skipped · Track Revealed</span>
+                        <XCircle size={16} />
+                        <span>Skipped · Revealed</span>
                       </span>
                     )}
 
@@ -1810,7 +1937,7 @@ export function App() {
                         />
                       ) : (
                         <div className="spotlight-cover-fallback">
-                          <Disc3 className={isPlaying ? 'spin-slow' : ''} size={46} />
+                          <Disc3 className={isPlaying ? 'spin-slow' : ''} size={42} />
                         </div>
                       )}
                       <button
@@ -1818,12 +1945,11 @@ export function App() {
                         className="spotlight-play-overlay"
                         onClick={() => void handlePlayToggle()}
                         aria-label={isPlaying ? 'Pause song' : 'Resume song'}
-                        title={isPlaying ? 'Pause playback' : 'Resume playback'}
                       >
                         {isPlaying ? (
-                          <Square size={22} />
+                          <Square size={20} />
                         ) : (
-                          <Play size={24} className="play-offset" />
+                          <Play size={22} className="play-offset" />
                         )}
                       </button>
                     </div>
@@ -1835,19 +1961,15 @@ export function App() {
                           <i />
                           <i />
                         </span>
-                        <span>
-                          {isPlaying
-                            ? 'Now Playing — Continues until you click Next Song'
-                            : 'Playback Paused — Click cover to resume'}
-                        </span>
+                        <span>{isPlaying ? 'Now Playing' : 'Paused'}</span>
                       </div>
                       <h2 className="spotlight-title">{currentTrack.title}</h2>
                       <p className="spotlight-artist">{currentTrack.artist}</p>
 
-                      {/* Favorited By Attribution in Result View */}
+                      {/* Favorited By Attribution */}
                       <div className="favorited-by-block">
                         <span className="favorited-by-label">
-                          <Heart size={13} className="heart-icon" />
+                          <Heart size={12} className="heart-icon" />
                           {(currentTrack.favoritedBy?.length ?? 0) >= 2
                             ? 'Shared Match! Favorited by:'
                             : 'Favorited by:'}
@@ -1866,13 +1988,16 @@ export function App() {
                                 />
                                 <strong>{fav.name}</strong>
                                 <span className="fav-provider-tag">
-                                  {fav.provider === 'youtube-music' ? 'YT Music' : 'Spotify'}
+                                  {fav.provider === 'youtube-music' ? 'YT' : 'Spotify'}
                                 </span>
                               </span>
                             ))
                           ) : (
                             <span className="favorited-user-pill">
-                              <span className="fav-dot" style={{ backgroundColor: 'var(--accent)' }} />
+                              <span
+                                className="fav-dot"
+                                style={{ backgroundColor: 'var(--accent)' }}
+                              />
                               <strong>You</strong>
                               <span className="fav-provider-tag">{activeProvider.displayName}</span>
                             </span>
@@ -1888,8 +2013,8 @@ export function App() {
                       className="btn-secondary"
                       onClick={() => setView('summary')}
                     >
-                      <Trophy size={16} />
-                      <span>View Run Rank</span>
+                      <Trophy size={15} />
+                      <span>Run Summary</span>
                     </button>
                     <button
                       type="button"
@@ -1898,19 +2023,19 @@ export function App() {
                       onClick={() => void startNewRound()}
                     >
                       <span>Next Song</span>
-                      <ArrowRight size={18} />
+                      <ArrowRight size={17} />
                     </button>
                   </div>
                 </div>
               )
             )}
 
-            {/* Wrong / Previous Attempts List */}
+            {/* Attempts List */}
             {guesses.length > 0 && (
               <div className="attempts-section">
                 <div className="attempts-header">
-                  <span>Your Attempts ({guesses.length})</span>
-                  <span>−{WRONG_GUESS_PENALTY} pts per wrong guess</span>
+                  <span>Attempts ({guesses.length})</span>
+                  <span>−{WRONG_GUESS_PENALTY} pts / wrong</span>
                 </div>
                 <div className="attempts-list">
                   {guesses.map((g, idx) => (
@@ -1918,14 +2043,13 @@ export function App() {
                       key={`${g.trackId}-${idx}`}
                       className={`attempt-item ${g.correct ? 'correct' : 'wrong'}`}
                     >
-                      {g.correct ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
+                      {g.correct ? <CheckCircle2 size={15} /> : <XCircle size={15} />}
                       <div className="attempt-song">
                         <strong>{g.title}</strong>
                         <span>{g.artist}</span>
                       </div>
                       <span className="attempt-badge">
-                        @{g.snippetDurationAtGuessSec.toFixed(1)}s{' '}
-                        {!g.correct && `· −${WRONG_GUESS_PENALTY}`}
+                        {g.snippetDurationAtGuessSec.toFixed(1)}s
                       </span>
                     </div>
                   ))}
