@@ -907,6 +907,8 @@ export class PartyRoomService {
       artworkUrl: t.artworkUrl,
       durationSec: t.durationSec,
       spotifyUri: t.spotifyUri,
+      releaseYear: t.releaseYear,
+      genres: t.genres,
       provider: t.provider,
     }));
 

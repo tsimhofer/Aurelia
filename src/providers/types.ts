@@ -26,6 +26,10 @@ export interface Track {
   provider: ProviderId;
   /** Optional Spotify URI for Web Playback SDK */
   spotifyUri?: string;
+  /** Optional release or publication year (e.g., 1984, 2016) for Era filtering */
+  releaseYear?: number;
+  /** Optional genre tags associated with the track */
+  genres?: string[];
   /** Party members who have this track in their liked songs */
   favoritedBy?: PartyMemberRef[];
 }

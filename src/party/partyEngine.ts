@@ -119,7 +119,7 @@ export function mergePartyCatalogs(members: PartyMember[]): MergedPartyPool {
         }
 
         // Prefer keeping a direct YouTube videoId for zero-latency playback,
-        // while preferring cleaner Spotify metadata/artwork when available.
+        // while preferring cleaner Spotify metadata/artwork/releaseYear when available.
         mergedTracks[existingIdx] = {
           ...existing,
           videoId: existing.videoId || rawTrack.videoId,
@@ -136,6 +136,11 @@ export function mergePartyCatalogs(members: PartyMember[]): MergedPartyPool {
             rawTrack.provider === 'spotify' && existing.provider !== 'spotify'
               ? rawTrack.artist
               : existing.artist,
+          releaseYear:
+            (rawTrack.provider === 'spotify' ? rawTrack.releaseYear : existing.releaseYear) ??
+            existing.releaseYear ??
+            rawTrack.releaseYear,
+          genres: existing.genres ?? rawTrack.genres,
           durationSec: existing.durationSec ?? rawTrack.durationSec,
           favoritedBy: favs,
         };

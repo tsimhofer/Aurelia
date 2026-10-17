@@ -385,6 +385,7 @@ export class SpotifyProvider implements MusicProvider {
       const data = (await response.json()) as {
         next?: string | null;
         items?: Array<{
+          added_at?: string;
           track?: {
             id?: string;
             uri?: string;
@@ -392,7 +393,7 @@ export class SpotifyProvider implements MusicProvider {
             duration_ms?: number;
             is_local?: boolean;
             artists?: Array<{ name?: string }>;
-            album?: { images?: Array<{ url?: string }> };
+            album?: { release_date?: string; images?: Array<{ url?: string }> };
           };
         }>;
       };
@@ -403,6 +404,11 @@ export class SpotifyProvider implements MusicProvider {
           continue;
         }
         seenIds.add(t.id);
+
+        const yearMatch = t.album?.release_date?.match(/^(\d{4})/);
+        const parsedYear = yearMatch ? Number(yearMatch[1]) : undefined;
+        const releaseYear =
+          parsedYear && parsedYear >= 1900 && parsedYear <= 2035 ? parsedYear : undefined;
 
         collected.push({
           id: t.id,
@@ -416,6 +422,7 @@ export class SpotifyProvider implements MusicProvider {
           artworkUrl: t.album?.images?.[0]?.url,
           durationSec: t.duration_ms ? Math.round(t.duration_ms / 1000) : undefined,
           spotifyUri: t.uri || `spotify:track:${t.id}`,
+          releaseYear,
           provider: 'spotify',
         });
       }

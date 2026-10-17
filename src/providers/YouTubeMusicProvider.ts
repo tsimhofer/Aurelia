@@ -75,6 +75,7 @@ interface YouTubePlaylistItemsResponse {
   items?: Array<{
     snippet?: {
       title?: string;
+      publishedAt?: string;
       videoOwnerChannelTitle?: string;
       channelTitle?: string;
       thumbnails?: {
@@ -88,6 +89,7 @@ interface YouTubePlaylistItemsResponse {
     };
     contentDetails?: {
       videoId?: string;
+      videoPublishedAt?: string;
     };
   }>;
 }
@@ -331,6 +333,12 @@ export class YouTubeMusicProvider implements MusicProvider {
           item.snippet?.thumbnails?.medium?.url ||
           item.snippet?.thumbnails?.default?.url;
 
+        const dateRaw = item.contentDetails?.videoPublishedAt || item.snippet?.publishedAt;
+        const yearMatch = dateRaw?.match(/^(\d{4})/);
+        const parsedYear = yearMatch ? Number(yearMatch[1]) : undefined;
+        const releaseYear =
+          parsedYear && parsedYear >= 1900 && parsedYear <= 2035 ? parsedYear : undefined;
+
         collected.push({
           id: videoId,
           videoId,
@@ -338,6 +346,7 @@ export class YouTubeMusicProvider implements MusicProvider {
           artist: cleanChannelTitle(rawChannel),
           channelTitle: rawChannel,
           artworkUrl,
+          releaseYear,
           provider: 'youtube-music',
         });
       }

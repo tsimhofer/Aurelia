@@ -21,6 +21,7 @@ import {
   Settings2,
   Share2,
   Shuffle,
+  SlidersHorizontal,
   Sparkles,
   Square,
   Trash2,
@@ -34,6 +35,18 @@ import {
 } from 'lucide-react';
 import { ConfettiCanvas } from './components/ConfettiCanvas';
 import { getEnvConfig } from './config/env';
+import {
+  DEFAULT_FILTER_CONFIG,
+  evaluateTrackPoolFilters,
+  inferTrackEra,
+  inferTrackGenres,
+  MUSIC_ERA_OPTIONS,
+  MUSIC_GENRE_OPTIONS,
+  MusicEraId,
+  MusicGenreId,
+  PoolMatchMode,
+  PreGameFilterConfig,
+} from './game/musicFilters';
 import {
   calculateLogarithmicBaseScore,
   calculateNetRoundScore,
@@ -96,6 +109,7 @@ interface PersistedGameSession {
   isPartyLobbyOpen: boolean;
   view: ScreenView;
   offsetMode: OffsetMode;
+  filterConfig?: PreGameFilterConfig;
   currentTrack: Track | null;
   startOffsetSec: number;
   snippetDurationSec: number;
@@ -404,7 +418,59 @@ export function App() {
         (guestRoomState.status === 'playing' || guestRoomState.status === 'revealed')
     );
 
-  const catalog = isPartyMode ? mergedPartyPool.tracks : soloCatalog;
+  const [filterConfig, setFilterConfig] = useState<PreGameFilterConfig>(
+    () => savedSession?.filterConfig ?? DEFAULT_FILTER_CONFIG
+  );
+  const [isSoloFilterOpen, setIsSoloFilterOpen] = useState<boolean>(
+    () => (savedSession?.roundHistory?.length ?? 0) === 0 && (savedSession?.guesses?.length ?? 0) === 0
+  );
+
+  const rawCatalog = isPartyMode ? mergedPartyPool.tracks : soloCatalog;
+
+  const effectiveFilterConfig = useMemo<PreGameFilterConfig>(
+    () => ({
+      matchMode:
+        !isPartyMode && filterConfig.matchMode === 'shared' ? 'all' : filterConfig.matchMode,
+      genres: filterConfig.genres,
+      eras: filterConfig.eras,
+    }),
+    [isPartyMode, filterConfig]
+  );
+
+  const filteredPoolStats = useMemo(
+    () =>
+      evaluateTrackPoolFilters(
+        rawCatalog,
+        isPartyMode ? partyMembers : [],
+        effectiveFilterConfig
+      ),
+    [rawCatalog, isPartyMode, partyMembers, effectiveFilterConfig]
+  );
+
+  const catalog = filteredPoolStats.filteredTracks;
+
+  const hasActiveFilters =
+    effectiveFilterConfig.matchMode !== 'all' ||
+    effectiveFilterConfig.genres.length > 0 ||
+    effectiveFilterConfig.eras.length > 0;
+
+  const activeFilterBadges = useMemo(() => {
+    const badges: string[] = [];
+    if (effectiveFilterConfig.matchMode === 'shared') {
+      badges.push('Shared Libraries Only');
+    } else if (effectiveFilterConfig.matchMode === 'similar') {
+      badges.push('Similar Music Only');
+    }
+    for (const g of effectiveFilterConfig.genres) {
+      const label = MUSIC_GENRE_OPTIONS.find((opt) => opt.id === g)?.shortLabel;
+      if (label) badges.push(label);
+    }
+    for (const e of effectiveFilterConfig.eras) {
+      const label = MUSIC_ERA_OPTIONS.find((opt) => opt.id === e)?.shortLabel;
+      if (label) badges.push(label);
+    }
+    return badges;
+  }, [effectiveFilterConfig]);
 
   // Game & Round State (Each player controls their own music player & snippet duration!)
   const [view, setView] = useState<ScreenView>(() => savedSession?.view ?? 'quiz');
@@ -466,6 +532,7 @@ export function App() {
         isPartyLobbyOpen,
         view,
         offsetMode,
+        filterConfig,
         currentTrack,
         startOffsetSec,
         snippetDurationSec,
@@ -487,6 +554,7 @@ export function App() {
     isPartyLobbyOpen,
     view,
     offsetMode,
+    filterConfig,
     currentTrack,
     startOffsetSec,
     snippetDurationSec,
@@ -699,12 +767,13 @@ export function App() {
     partyLeaderboard,
   ]);
 
-  // Broadcast merged catalog search index whenever mergedPartyPool changes on the Host
+  // Broadcast merged catalog search index whenever active filtered pool changes on the Host
   useEffect(() => {
-    if (isOnlinePartyHost && mergedPartyPool.tracks.length > 0) {
-      partyRoomRef.current?.broadcastCatalogIndex(mergedPartyPool.tracks);
+    const poolToBroadcast = catalog.length > 0 ? catalog : mergedPartyPool.tracks;
+    if (isOnlinePartyHost && poolToBroadcast.length > 0) {
+      partyRoomRef.current?.broadcastCatalogIndex(poolToBroadcast);
     }
-  }, [isOnlinePartyHost, mergedPartyPool.tracks]);
+  }, [isOnlinePartyHost, catalog, mergedPartyPool.tracks]);
 
   const resetAllPartyMembersToUnready = useCallback(() => {
     const current = partyMembersRef.current;
@@ -1190,6 +1259,7 @@ export function App() {
       setIsPartyLobbyOpen(true);
     } else {
       setIsPartyLobbyOpen(false);
+      setIsSoloFilterOpen(true);
       try {
         localStorage.setItem(STORAGE_KEY_ACTIVE_PROVIDER, nextMode);
       } catch {
@@ -1200,7 +1270,14 @@ export function App() {
       const cached = nextProvider.getCachedCatalog();
       setSoloCatalog(cached);
       if (cached.length > 0) {
-        void startNewRound(cached, false, new Set(), {}, 1);
+        const nextStats = evaluateTrackPoolFilters(cached, [], {
+          matchMode: filterConfig.matchMode === 'shared' ? 'all' : filterConfig.matchMode,
+          genres: filterConfig.genres,
+          eras: filterConfig.eras,
+        });
+        const initialPool =
+          nextStats.filteredTracks.length > 0 ? nextStats.filteredTracks : cached;
+        void startNewRound(initialPool, false, new Set(), {}, 1);
       }
     }
   };
@@ -1241,11 +1318,18 @@ export function App() {
   }, [gameMode, activeProvider]);
 
   useEffect(() => {
-    if (!isPartyMode && soloCatalog.length > 0 && !currentTrack && view === 'quiz') {
-      void startNewRound(soloCatalog, false);
+    if (
+      !isPartyMode &&
+      catalog.length > 0 &&
+      view === 'quiz' &&
+      roundHistory.length === 0 &&
+      guesses.length === 0 &&
+      (!currentTrack || !catalog.some((t) => t.id === currentTrack.id))
+    ) {
+      void startNewRound(catalog, false, new Set(), {}, 1);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [soloCatalog, isPartyMode]);
+  }, [catalog, isPartyMode]);
 
   // Handle Spotify PKCE OAuth redirect callback (?code=...) on mount
   useEffect(() => {
@@ -1542,12 +1626,55 @@ export function App() {
     setPartyMembers(updated);
   };
 
+  const handleSelectMatchMode = (mode: PoolMatchMode) => {
+    setFilterConfig((prev) => ({ ...prev, matchMode: mode }));
+  };
+
+  const handleToggleGenre = (genreId: MusicGenreId) => {
+    setFilterConfig((prev) => {
+      const exists = prev.genres.includes(genreId);
+      return {
+        ...prev,
+        genres: exists ? prev.genres.filter((g) => g !== genreId) : [...prev.genres, genreId],
+      };
+    });
+  };
+
+  const handleClearGenres = () => {
+    setFilterConfig((prev) => ({ ...prev, genres: [] }));
+  };
+
+  const handleToggleEra = (eraId: MusicEraId) => {
+    setFilterConfig((prev) => {
+      const exists = prev.eras.includes(eraId);
+      return {
+        ...prev,
+        eras: exists ? prev.eras.filter((e) => e !== eraId) : [...prev.eras, eraId],
+      };
+    });
+  };
+
+  const handleClearEras = () => {
+    setFilterConfig((prev) => ({ ...prev, eras: [] }));
+  };
+
+  const handleResetFilters = () => {
+    setFilterConfig(DEFAULT_FILTER_CONFIG);
+  };
+
+  const handleApplySoloFiltersAndStart = async () => {
+    if (catalog.length === 0 || isPreparingRound) return;
+    cancelCurrentGame();
+    setIsSoloFilterOpen(false);
+    await startNewRound(catalog, false, new Set(), {}, 1);
+  };
+
   const handleStartPartyQuiz = async () => {
-    if (!allPartyMembersReady || mergedPartyPool.tracks.length === 0 || isPreparingRound) {
+    if (!allPartyMembersReady || catalog.length === 0 || isPreparingRound) {
       return;
     }
     cancelCurrentGame();
-    await startNewRound(mergedPartyPool.tracks, true, new Set(), {}, 1);
+    await startNewRound(catalog, true, new Set(), {}, 1);
     setIsPartyLobbyOpen(false);
   };
 
@@ -1617,6 +1744,7 @@ export function App() {
 
   const triggerPlayDuration = async (targetDurationSec: number) => {
     if (!effectiveTrack) return;
+    setIsSoloFilterOpen(false);
     setErrorMessage(null);
     setIsPlaying(true);
     setPlaybackElapsedSec(0);
@@ -1691,13 +1819,14 @@ export function App() {
         artworkUrl: t.artworkUrl,
       }));
     }
-    return catalog.map((t) => ({
+    const sourcePool = catalog.length > 0 ? catalog : rawCatalog;
+    return sourcePool.map((t) => ({
       id: t.id,
       title: t.title,
       artist: t.artist,
       artworkUrl: t.artworkUrl,
     }));
-  }, [isRemoteGuestPlaying, guestCatalog, newPlayerProvider, catalog]);
+  }, [isRemoteGuestPlaying, guestCatalog, newPlayerProvider, catalog, rawCatalog]);
 
   const filteredSuggestions = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -1884,8 +2013,14 @@ export function App() {
 
   const handleResetRun = () => {
     cancelCurrentGame();
-    if (catalog.length > 0) {
-      void startNewRound(catalog, isPartyMode);
+    if (isPartyMode) {
+      resetAllPartyMembersToUnready();
+      setIsPartyLobbyOpen(true);
+    } else {
+      setIsSoloFilterOpen(true);
+      if (catalog.length > 0) {
+        void startNewRound(catalog, false);
+      }
     }
   };
 
@@ -1943,6 +2078,185 @@ export function App() {
     ? Math.min(100, (playbackElapsedSec / MAX_SNIPPET_SECONDS) * 100)
     : unlockedPercent;
 
+  const renderPreGameFilterControls = (isPartyContext: boolean) => (
+    <div className="pregame-filter-card" aria-label="Pre-Game Song Selection">
+      <div className="pregame-filter-header">
+        <span className="section-label">
+          <SlidersHorizontal size={13} /> Pre-Game Song Selection &amp; Filters
+        </span>
+        <div className="pregame-filter-meta">
+          <span className="filter-match-pill">
+            <strong>{catalog.length}</strong> / {rawCatalog.length} songs match
+          </span>
+          {hasActiveFilters && (
+            <button type="button" className="btn-reset-filters" onClick={handleResetFilters}>
+              Reset Filters
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* 1. Library Overlap / Similarity Selection */}
+      <div className="filter-group">
+        <span className="filter-group-label">Library Selection</span>
+        <div className={`match-mode-grid ${isPartyContext ? 'cols-3' : 'cols-2'}`}>
+          <button
+            type="button"
+            className={`match-mode-btn ${
+              effectiveFilterConfig.matchMode === 'all' ? 'active' : ''
+            }`}
+            onClick={() => handleSelectMatchMode('all')}
+          >
+            <div className="match-mode-top">
+              <strong>All Songs</strong>
+              <span className="match-mode-count">{filteredPoolStats.allCount}</span>
+            </div>
+            <span className="match-mode-desc">
+              {isPartyContext
+                ? 'Play all merged songs (shared matches first, fair rotation)'
+                : 'Play from your entire liked songs library'}
+            </span>
+          </button>
+
+          {isPartyContext && (
+            <button
+              type="button"
+              className={`match-mode-btn ${
+                effectiveFilterConfig.matchMode === 'shared' ? 'active' : ''
+              }`}
+              onClick={() => handleSelectMatchMode('shared')}
+            >
+              <div className="match-mode-top">
+                <strong>Shared Libraries Only</strong>
+                <span className="match-mode-count">{filteredPoolStats.sharedCount}</span>
+              </div>
+              <span className="match-mode-desc">
+                Only play songs favorited by 2+ players
+              </span>
+            </button>
+          )}
+
+          <button
+            type="button"
+            className={`match-mode-btn ${
+              effectiveFilterConfig.matchMode === 'similar' ? 'active' : ''
+            }`}
+            onClick={() => handleSelectMatchMode('similar')}
+          >
+            <div className="match-mode-top">
+              <strong>Similar Music Only</strong>
+              <span className="match-mode-count">{filteredPoolStats.similarCount}</span>
+            </div>
+            <span className="match-mode-desc">
+              {isPartyContext
+                ? 'Shared songs, shared artists & overlapping genres'
+                : 'Songs by your recurring favorite artists'}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      {/* 2. Genre Selection */}
+      <div className="filter-group">
+        <span className="filter-group-label">Genres</span>
+        <div className="filter-chips-wrap">
+          <button
+            type="button"
+            className={`filter-chip ${
+              effectiveFilterConfig.genres.length === 0 ? 'active' : ''
+            }`}
+            onClick={handleClearGenres}
+          >
+            <span>All Genres</span>
+          </button>
+          {MUSIC_GENRE_OPTIONS.map((genre) => {
+            const count = filteredPoolStats.genreCounts[genre.id] ?? 0;
+            const isSelected = effectiveFilterConfig.genres.includes(genre.id);
+            return (
+              <button
+                key={genre.id}
+                type="button"
+                className={`filter-chip ${isSelected ? 'active' : ''} ${
+                  count === 0 && !isSelected ? 'empty' : ''
+                }`}
+                onClick={() => handleToggleGenre(genre.id)}
+              >
+                <span>{genre.shortLabel}</span>
+                <span className="filter-chip-count">{count}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* 3. Era / Decade Selection */}
+      <div className="filter-group">
+        <span className="filter-group-label">Eras &amp; Decades</span>
+        <div className="filter-chips-wrap">
+          <button
+            type="button"
+            className={`filter-chip ${
+              effectiveFilterConfig.eras.length === 0 ? 'active' : ''
+            }`}
+            onClick={handleClearEras}
+          >
+            <span>All Eras</span>
+          </button>
+          {MUSIC_ERA_OPTIONS.map((era) => {
+            const count = filteredPoolStats.eraCounts[era.id] ?? 0;
+            const isSelected = effectiveFilterConfig.eras.includes(era.id);
+            return (
+              <button
+                key={era.id}
+                type="button"
+                className={`filter-chip ${isSelected ? 'active' : ''} ${
+                  count === 0 && !isSelected ? 'empty' : ''
+                }`}
+                onClick={() => handleToggleEra(era.id)}
+              >
+                <span>{era.shortLabel}</span>
+                <span className="filter-chip-count">{count}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {catalog.length === 0 && (
+        <div className="filter-empty-warning">
+          <AlertCircle size={15} />
+          <span>
+            No songs match your current filter selection.{' '}
+            {effectiveFilterConfig.matchMode === 'shared' && filteredPoolStats.sharedCount === 0
+              ? 'No exact duplicate songs were found across players — try "Similar Music Only" or "All Songs"!'
+              : 'Try selecting additional genres/eras or resetting filters.'}
+          </span>
+          <button type="button" className="btn-chip" onClick={handleResetFilters}>
+            Reset Filters
+          </button>
+        </div>
+      )}
+
+      {!isPartyContext && (
+        <div className="solo-filter-actions">
+          <button
+            type="button"
+            className="btn-primary btn-full-width"
+            disabled={catalog.length === 0 || isPreparingRound}
+            onClick={() => void handleApplySoloFiltersAndStart()}
+          >
+            <Play size={15} />
+            <span>
+              {catalog.length === 0
+                ? 'Select Filters with Matching Songs to Start'
+                : `Start Game with Selection (${catalog.length} Songs)`}
+            </span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="app-shell" data-provider={gameMode}>
       {/* Simplified Mobile-First Top Navigation */}
@@ -1956,7 +2270,7 @@ export function App() {
           </div>
 
           <div className="nav-right">
-            {((catalog.length > 0 && (!isPartyMode || !isPartyLobbyOpen)) ||
+            {((rawCatalog.length > 0 && (!isPartyMode || !isPartyLobbyOpen)) ||
               isRemoteGuestPlaying) && (
               <div className="session-scoreboard">
                 <div className="score-chip">
@@ -2138,7 +2452,7 @@ export function App() {
         {/* ====================================================================
             1. PARTY MODE LOBBY VIEW (Same Room Local, Online Remote, or Co-Op)
             ==================================================================== */}
-        {isPartyMode && !isRemoteGuestPlaying && (isPartyLobbyOpen || catalog.length === 0) ? (
+        {isPartyMode && !isRemoteGuestPlaying && (isPartyLobbyOpen || rawCatalog.length === 0) ? (
           <section className="surface-card party-lobby-card" aria-label="Party Mode Lobby">
             {/* Top-Level Party Differentiation: Same Room (Local), Online Room (Remote), Co-Op (Shared Score) */}
             <div className="party-location-switcher">
@@ -2474,10 +2788,12 @@ export function App() {
                         ))}
                       </div>
 
+                      {renderPreGameFilterControls(true)}
+
                       <button
                         type="button"
                         className="btn-primary btn-full-width"
-                        disabled={!allPartyMembersReady || isPreparingRound}
+                        disabled={!allPartyMembersReady || catalog.length === 0 || isPreparingRound}
                         onClick={() => void handleStartPartyQuiz()}
                       >
                         <Play size={16} />
@@ -2488,11 +2804,13 @@ export function App() {
                               ? `Sync Up: Waiting for ${unreadyPartyMembersCount} player${
                                   unreadyPartyMembersCount > 1 ? 's' : ''
                                 } to Ready Up...`
-                              : partyLocationMode === 'coop'
-                                ? `Start Co-Op Quiz (${mergedPartyPool.totalUniqueCount} Songs · Shared Score)`
-                                : `Start ${
-                                    partyLocationMode === 'local' ? 'Same-Room' : 'Online'
-                                  } Party Quiz (${mergedPartyPool.totalUniqueCount} Songs)`}
+                              : catalog.length === 0
+                                ? 'No Songs Match Filters — Adjust Selection Above'
+                                : partyLocationMode === 'coop'
+                                  ? `Start Co-Op Quiz (${catalog.length} Songs · Shared Score)`
+                                  : `Start ${
+                                      partyLocationMode === 'local' ? 'Same-Room' : 'Online'
+                                    } Party Quiz (${catalog.length} Songs)`}
                         </span>
                       </button>
                     </>
@@ -2637,7 +2955,7 @@ export function App() {
               </div>
             )}
           </section>
-        ) : !isRemoteGuestPlaying && catalog.length === 0 ? (
+        ) : !isRemoteGuestPlaying && rawCatalog.length === 0 ? (
           /* 2. SIMPLIFIED SOLO ONBOARDING VIEW */
           <section className="surface-card onboarding-view">
             <div className="hero-badge">
@@ -2803,7 +3121,7 @@ export function App() {
               active={roundState === 'won' || activeOnlineStatus === 'correct'}
             />
 
-            {isPartyMode && (
+            {isPartyMode ? (
               <div className="party-active-bar">
                 <div className="party-roster-chips">
                   {isCoopParty ? (
@@ -2834,14 +3152,12 @@ export function App() {
                   ) : partyLocationMode === 'remote' ? (
                     <span className="party-bar-label">
                       <Globe size={13} /> Online Room <strong>{hostRoomCode}</strong> ·{' '}
-                      {mergedPartyPool.sharedMatchesCount} shared ·{' '}
-                      {mergedPartyPool.totalUniqueCount} songs
+                      {catalog.length} active songs
                     </span>
                   ) : (
                     <>
                       <span className="party-bar-label">
-                        <Home size={13} /> Local Party ({mergedPartyPool.sharedMatchesCount} shared
-                        · {mergedPartyPool.totalUniqueCount} songs):
+                        <Home size={13} /> Local Party ({catalog.length} active songs):
                       </span>
                       {partyMembers.map((m) => (
                         <span
@@ -2855,6 +3171,12 @@ export function App() {
                       ))}
                     </>
                   )}
+                  {!isRemoteGuestPlaying &&
+                    activeFilterBadges.map((badge) => (
+                      <span key={badge} className="active-filter-tag">
+                        {badge}
+                      </span>
+                    ))}
                 </div>
 
                 <div className="party-bar-actions">
@@ -2882,9 +3204,42 @@ export function App() {
                       }
                     }}
                   >
-                    {isRemoteGuestPlaying ? 'Leave Room' : 'Lobby'}
+                    {isRemoteGuestPlaying ? 'Leave Room' : 'Lobby & Filters'}
                   </button>
                 </div>
+              </div>
+            ) : (
+              <div className="solo-filter-stage-wrap">
+                <div className="party-active-bar solo-pool-bar">
+                  <div className="party-roster-chips">
+                    <span className="party-bar-label">
+                      <SlidersHorizontal size={13} /> Song Pool:{' '}
+                      <strong>
+                        {catalog.length} of {rawCatalog.length} songs
+                      </strong>
+                    </span>
+                    {activeFilterBadges.length > 0 ? (
+                      activeFilterBadges.map((badge) => (
+                        <span key={badge} className="active-filter-tag">
+                          {badge}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="active-filter-tag subtle">All Genres &amp; Eras</span>
+                    )}
+                  </div>
+                  <div className="party-bar-actions">
+                    <button
+                      type="button"
+                      className={`btn-party-lobby-link ${isSoloFilterOpen ? 'active' : ''}`}
+                      onClick={() => setIsSoloFilterOpen((v) => !v)}
+                    >
+                      <SlidersHorizontal size={12} />
+                      <span>{isSoloFilterOpen ? 'Hide Song Filters' : 'Song Filters'}</span>
+                    </button>
+                  </div>
+                </div>
+                {isSoloFilterOpen && renderPreGameFilterControls(false)}
               </div>
             )}
 
@@ -3207,6 +3562,25 @@ export function App() {
                       </div>
                       <h2 className="spotlight-title">{effectiveTrack.title}</h2>
                       <p className="spotlight-artist">{effectiveTrack.artist}</p>
+                      <div className="spotlight-tags-row">
+                        <span className="spotlight-era-tag">
+                          {MUSIC_ERA_OPTIONS.find((e) => e.id === inferTrackEra(effectiveTrack))
+                            ?.shortLabel ?? '2010s'}
+                          {effectiveTrack.releaseYear ? ` (${effectiveTrack.releaseYear})` : ''}
+                        </span>
+                        {inferTrackGenres(effectiveTrack)
+                          .slice(0, 2)
+                          .map((gId) => {
+                            const gLabel = MUSIC_GENRE_OPTIONS.find(
+                              (opt) => opt.id === gId
+                            )?.shortLabel;
+                            return gLabel ? (
+                              <span key={gId} className="spotlight-genre-tag">
+                                {gLabel}
+                              </span>
+                            ) : null;
+                          })}
+                      </div>
 
                       {/* Favorited By Attribution */}
                       <div className="favorited-by-block">
