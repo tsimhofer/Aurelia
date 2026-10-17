@@ -995,82 +995,208 @@ body {
 }
 
 /* ============================================================================
-   ROUND REVEAL CARD
+   CONFETTI & FOCUSED RESULT SPOTLIGHT
    ============================================================================ */
-.reveal-card {
+.confetti-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  pointer-events: none;
+  z-index: 100;
+}
+
+.quiz-stage.result-focused.won {
+  border-color: rgba(16, 185, 129, 0.55);
+  box-shadow: 6px 6px 0px rgba(16, 185, 129, 0.28);
+}
+
+.result-spotlight {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 1.5rem;
+  animation: spotlightPop 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes spotlightPop {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.spotlight-badge-row {
+  display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1.25rem;
-  padding: 1.2rem;
-  border-radius: var(--radius-md);
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  padding-bottom: 1rem;
+  border-bottom: 1.5px solid var(--border-subtle);
 }
 
-.reveal-card.won {
-  background: rgba(16, 185, 129, 0.1);
-  border: 1.5px solid rgba(16, 185, 129, 0.45);
-}
-
-.reveal-card.gave-up {
-  background: rgba(244, 63, 94, 0.08);
-  border: 1.5px solid rgba(244, 63, 94, 0.4);
-}
-
-.reveal-song-row {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-}
-
-.reveal-cover,
-.reveal-cover-fallback {
-  width: 66px;
-  height: 66px;
-  border-radius: var(--radius-sm);
-  border: 1.5px solid var(--border-strong);
-  object-fit: cover;
-  flex-shrink: 0;
-}
-
-.reveal-cover-fallback {
-  background: var(--bg-elevated);
-  display: grid;
-  place-items: center;
-  color: var(--text-muted);
-}
-
-.reveal-status-pill {
+.spotlight-status {
   display: inline-flex;
   align-items: center;
-  gap: 0.4rem;
-  font-size: 0.78rem;
+  gap: 0.45rem;
+  font-size: 0.85rem;
   font-weight: 700;
-  margin-bottom: 0.28rem;
+  padding: 0.38rem 0.85rem;
+  border-radius: var(--radius-sm);
 }
 
-.reveal-card.won .reveal-status-pill {
+.spotlight-status.won {
+  background: rgba(16, 185, 129, 0.14);
+  border: 1.5px solid rgba(16, 185, 129, 0.45);
   color: #6ee7b7;
 }
 
-.reveal-card.gave-up .reveal-status-pill {
+.spotlight-status.gave-up {
+  background: rgba(244, 63, 94, 0.12);
+  border: 1.5px solid rgba(244, 63, 94, 0.4);
   color: #fda4af;
 }
 
-.reveal-title {
-  font-family: var(--font-display);
-  font-size: 1.15rem;
-  font-weight: 700;
+.spotlight-points-award {
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 800;
+  color: var(--accent);
 }
 
-.reveal-artist {
-  font-size: 0.85rem;
+.spotlight-stage {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  background: var(--bg-subtle);
+  border: 1.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 1.35rem;
+}
+
+.spotlight-cover-wrap {
+  position: relative;
+  width: 112px;
+  height: 112px;
+  border-radius: var(--radius-md);
+  border: 1.5px solid var(--border-strong);
+  overflow: hidden;
+  flex-shrink: 0;
+  box-shadow: 4px 4px 0px rgba(0, 0, 0, 0.55);
+}
+
+.spotlight-cover-wrap.playing {
+  border-color: var(--accent);
+}
+
+.spotlight-cover,
+.spotlight-cover-fallback {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.spotlight-cover-fallback {
+  background: var(--bg-elevated);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+}
+
+.spotlight-play-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  border: none;
+  color: #fff;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.spotlight-cover-wrap:hover .spotlight-play-overlay {
+  opacity: 1;
+}
+
+.spotlight-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.now-playing-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  color: var(--accent);
+  margin-bottom: 0.15rem;
+}
+
+.eq-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+
+.eq-bars i {
+  display: block;
+  width: 3px;
+  height: 4px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+
+.eq-bars.active i:nth-child(1) {
+  animation: eqBounce 0.55s ease-in-out infinite alternate;
+}
+.eq-bars.active i:nth-child(2) {
+  animation: eqBounce 0.4s ease-in-out 0.15s infinite alternate;
+}
+.eq-bars.active i:nth-child(3) {
+  animation: eqBounce 0.65s ease-in-out 0.25s infinite alternate;
+}
+
+@keyframes eqBounce {
+  from {
+    height: 3px;
+  }
+  to {
+    height: 12px;
+  }
+}
+
+.spotlight-title {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.spotlight-artist {
+  font-size: 0.98rem;
   color: var(--text-muted);
 }
 
-.reveal-cta-row {
+.spotlight-actions {
   display: flex;
-  gap: 0.65rem;
+  justify-content: flex-end;
+  gap: 0.75rem;
+}
+
+.btn-next-song-lg {
+  padding: 0.8rem 1.5rem;
+  font-size: 0.95rem;
 }
 
 .btn-primary,

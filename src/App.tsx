@@ -22,6 +22,7 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
+import { ConfettiCanvas } from './components/ConfettiCanvas';
 import { getEnvConfig } from './config/env';
 import {
   calculateLogarithmicBaseScore,
@@ -291,8 +292,17 @@ export function App() {
       setIsPlaying(false);
       return;
     }
-    const playLen = roundState === 'playing' ? snippetDurationSec : MAX_SNIPPET_SECONDS;
-    await triggerPlayDuration(playLen);
+    if (roundState !== 'playing') {
+      setIsPlaying(true);
+      try {
+        await activeProvider.playFullTrack(currentTrack, startOffsetSec);
+      } catch (err) {
+        setIsPlaying(false);
+        setErrorMessage(err instanceof Error ? err.message : 'Playback error');
+      }
+      return;
+    }
+    await triggerPlayDuration(snippetDurationSec);
   };
 
   const handleScrubberChange = (newDuration: number, autoPlay = false) => {
@@ -347,10 +357,12 @@ export function App() {
     setIsDropdownOpen(false);
 
     if (isCorrect) {
-      activeProvider.stopPlayback();
-      setIsPlaying(false);
       const awarded = calculateNetRoundScore(usedDur, wrongGuessesCount);
       setRoundState('won');
+      setIsPlaying(true);
+      void activeProvider.playFullTrack(currentTrack, startOffsetSec).catch(() => {
+        setIsPlaying(false);
+      });
       setUsedTrackIds((prev) => new Set(prev).add(currentTrack.id));
       setRoundHistory((prev) => [
         ...prev,
@@ -370,10 +382,12 @@ export function App() {
 
   const handleGiveUp = () => {
     if (!currentTrack || roundState !== 'playing') return;
-    activeProvider.stopPlayback();
-    setIsPlaying(false);
     const usedDur = Math.max(snippetDurationSec, maxUnlockedDurationSec);
     setRoundState('gave-up');
+    setIsPlaying(true);
+    void activeProvider.playFullTrack(currentTrack, startOffsetSec).catch(() => {
+      setIsPlaying(false);
+    });
     setUsedTrackIds((prev) => new Set(prev).add(currentTrack.id));
     setRoundHistory((prev) => [
       ...prev,
@@ -761,259 +775,301 @@ export function App() {
           </section>
         ) : (
           /* ACTIVE QUIZ VIEW */
-          <section className="surface-card quiz-stage">
-            {/* Top Status Row: Potential Points & Snippet Badge */}
-            <div className="stage-header">
-              <div className="potential-score-box">
-                <span className="stage-eyebrow">Points at Stake</span>
-                <div className="points-display-row">
-                  <span className="points-value">{potentialNetPoints.toLocaleString()}</span>
-                  <span className="points-unit">pts</span>
-                  {wrongGuessesCount > 0 && (
-                    <span className="penalty-badge" title={`${wrongGuessesCount} wrong guess(es)`}>
-                      −{(wrongGuessesCount * WRONG_GUESS_PENALTY).toLocaleString()} penalty
-                    </span>
+          <section
+            className={`surface-card quiz-stage ${
+              roundState !== 'playing' ? `result-focused ${roundState}` : ''
+            }`}
+          >
+            <ConfettiCanvas active={roundState === 'won'} />
+
+            {roundState === 'playing' ? (
+              <>
+                {/* Top Status Row: Potential Points & Snippet Badge */}
+                <div className="stage-header">
+                  <div className="potential-score-box">
+                    <span className="stage-eyebrow">Points at Stake</span>
+                    <div className="points-display-row">
+                      <span className="points-value">{potentialNetPoints.toLocaleString()}</span>
+                      <span className="points-unit">pts</span>
+                      {wrongGuessesCount > 0 && (
+                        <span
+                          className="penalty-badge"
+                          title={`${wrongGuessesCount} wrong guess(es)`}
+                        >
+                          −{(wrongGuessesCount * WRONG_GUESS_PENALTY).toLocaleString()} penalty
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="snippet-length-box">
+                    <span className="stage-eyebrow">Unlocked Audio</span>
+                    <div className="length-display-row">
+                      <Ear size={18} className="ear-icon" />
+                      <span className="length-value">{snippetDurationSec.toFixed(1)}s</span>
+                      <span className="length-max">/ 30s</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Central Audio Player & Interactive Timeline Scrubber */}
+                <div className={`player-deck ${isPlaying ? 'is-playing' : ''}`}>
+                  <div className="player-main-row">
+                    <button
+                      type="button"
+                      className={`hero-play-btn ${isPlaying ? 'playing' : ''}`}
+                      onClick={() => void handlePlayToggle()}
+                      disabled={!currentTrack}
+                      aria-label={isPlaying ? 'Stop playback' : 'Play snippet'}
+                    >
+                      {isPlaying ? (
+                        <Square size={26} />
+                      ) : (
+                        <Play size={28} className="play-offset" />
+                      )}
+                    </button>
+
+                    <div className="timeline-column">
+                      <div className="timeline-status-row">
+                        <span className="status-text">
+                          {isPlaying ? (
+                            <>
+                              <Volume2 size={15} className="pulse-icon" /> Playing snippet (
+                              {playbackElapsedSec.toFixed(1)}s / {snippetDurationSec.toFixed(1)}s)
+                            </>
+                          ) : (
+                            <>Drag slider or tap a milestone to unlock more of the song</>
+                          )}
+                        </span>
+                        <span className="curve-hint">
+                          Base: {baseCurvePoints.toLocaleString()} pts
+                        </span>
+                      </div>
+
+                      {/* Custom Visual Progress + Scrubber */}
+                      <div className="scrubber-track-wrapper">
+                        <div className="scrubber-rail">
+                          <div
+                            className="scrubber-unlocked-fill"
+                            style={{ width: `${unlockedPercent}%` }}
+                          />
+                          {isPlaying && (
+                            <div
+                              className="scrubber-playhead-fill"
+                              style={{ width: `${playheadPercent}%` }}
+                            />
+                          )}
+                        </div>
+                        <input
+                          type="range"
+                          min={MIN_SNIPPET_SECONDS}
+                          max={MAX_SNIPPET_SECONDS}
+                          step={0.1}
+                          value={snippetDurationSec}
+                          onChange={(e) => handleScrubberChange(parseFloat(e.target.value), false)}
+                          className="scrubber-input-overlay"
+                          aria-label="Snippet duration in seconds"
+                        />
+                      </div>
+
+                      {/* Clickable Milestone Pills */}
+                      <div className="milestone-bar">
+                        {MILESTONE_SECONDS.map((sec) => {
+                          const isActive = Math.abs(snippetDurationSec - sec) < 0.05;
+                          const isUnlocked = sec <= maxUnlockedDurationSec;
+                          return (
+                            <button
+                              key={sec}
+                              type="button"
+                              className={`milestone-pill ${isActive ? 'current' : ''} ${
+                                isUnlocked ? 'unlocked' : ''
+                              }`}
+                              onClick={() => handleScrubberChange(sec, true)}
+                              title={`Set snippet to ${sec}s (${calculateLogarithmicBaseScore(sec).toLocaleString()} base pts) and play`}
+                            >
+                              {sec}s
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Search & Guess Input */}
+                <div className="guess-zone">
+                  <div className="search-bar-container">
+                    <div className="search-field-box">
+                      <Search className="search-icon" size={19} />
+                      <input
+                        ref={searchInputRef}
+                        type="text"
+                        className="search-input"
+                        placeholder={`Search ${catalog.length} songs in your ${activeProvider.displayName} library...`}
+                        value={searchQuery}
+                        onFocus={() => setIsDropdownOpen(true)}
+                        onChange={(e) => {
+                          setSearchQuery(e.target.value);
+                          setSelectedSuggestionIdx(0);
+                          setIsDropdownOpen(true);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'ArrowDown') {
+                            e.preventDefault();
+                            setSelectedSuggestionIdx((i) =>
+                              Math.min(i + 1, Math.max(0, filteredSuggestions.length - 1))
+                            );
+                          } else if (e.key === 'ArrowUp') {
+                            e.preventDefault();
+                            setSelectedSuggestionIdx((i) => Math.max(0, i - 1));
+                          } else if (
+                            e.key === 'Enter' &&
+                            filteredSuggestions[selectedSuggestionIdx]
+                          ) {
+                            e.preventDefault();
+                            submitGuess(filteredSuggestions[selectedSuggestionIdx]);
+                          } else if (e.key === 'Escape') {
+                            setIsDropdownOpen(false);
+                          }
+                        }}
+                      />
+                      {searchQuery && (
+                        <button
+                          type="button"
+                          className="clear-search-btn"
+                          onClick={() => {
+                            setSearchQuery('');
+                            searchInputRef.current?.focus();
+                          }}
+                          aria-label="Clear search"
+                        >
+                          <X size={16} />
+                        </button>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      className="btn-skip-round"
+                      onClick={handleGiveUp}
+                      title="Reveal the song and move to the next round"
+                    >
+                      <Flag size={15} />
+                      <span>Give Up</span>
+                    </button>
+                  </div>
+
+                  {/* Autocomplete Suggestions Dropdown */}
+                  {isDropdownOpen && searchQuery.trim().length > 0 && (
+                    <div className="suggestions-popover" role="listbox">
+                      {filteredSuggestions.length > 0 ? (
+                        filteredSuggestions.map((track, idx) => (
+                          <button
+                            key={track.id}
+                            type="button"
+                            role="option"
+                            aria-selected={idx === selectedSuggestionIdx}
+                            className={`suggestion-row ${
+                              idx === selectedSuggestionIdx ? 'selected' : ''
+                            }`}
+                            onMouseEnter={() => setSelectedSuggestionIdx(idx)}
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              submitGuess(track);
+                            }}
+                          >
+                            {track.artworkUrl ? (
+                              <img src={track.artworkUrl} alt="" className="suggestion-art" />
+                            ) : (
+                              <div className="suggestion-art-fallback">
+                                <Music2 size={15} />
+                              </div>
+                            )}
+                            <div className="suggestion-text">
+                              <span className="suggestion-title">{track.title}</span>
+                              <span className="suggestion-artist">{track.artist}</span>
+                            </div>
+                            <span className="suggestion-submit-hint">Guess ↵</span>
+                          </button>
+                        ))
+                      ) : (
+                        <div className="suggestions-empty">
+                          No matching tracks found in your cached library.
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
-              </div>
+              </>
+            ) : (
+              /* FOCUSED ROUND RESULT SPOTLIGHT */
+              currentTrack && (
+                <div className={`result-spotlight ${roundState}`}>
+                  <div className="spotlight-badge-row">
+                    {roundState === 'won' ? (
+                      <span className="spotlight-status won">
+                        <CheckCircle2 size={17} />
+                        <span>Identified in {effectiveScoringDuration.toFixed(1)}s!</span>
+                      </span>
+                    ) : (
+                      <span className="spotlight-status gave-up">
+                        <XCircle size={17} />
+                        <span>Round Skipped · Track Revealed</span>
+                      </span>
+                    )}
 
-              <div className="snippet-length-box">
-                <span className="stage-eyebrow">Unlocked Audio</span>
-                <div className="length-display-row">
-                  <Ear size={18} className="ear-icon" />
-                  <span className="length-value">{snippetDurationSec.toFixed(1)}s</span>
-                  <span className="length-max">/ 30s</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Central Audio Player & Interactive Timeline Scrubber */}
-            <div className={`player-deck ${isPlaying ? 'is-playing' : ''}`}>
-              <div className="player-main-row">
-                <button
-                  type="button"
-                  className={`hero-play-btn ${isPlaying ? 'playing' : ''}`}
-                  onClick={() => void handlePlayToggle()}
-                  disabled={!currentTrack}
-                  aria-label={isPlaying ? 'Stop playback' : 'Play snippet'}
-                >
-                  {isPlaying ? <Square size={26} /> : <Play size={28} className="play-offset" />}
-                </button>
-
-                <div className="timeline-column">
-                  <div className="timeline-status-row">
-                    <span className="status-text">
-                      {isPlaying ? (
-                        <>
-                          <Volume2 size={15} className="pulse-icon" /> Playing snippet (
-                          {playbackElapsedSec.toFixed(1)}s / {snippetDurationSec.toFixed(1)}s)
-                        </>
-                      ) : (
-                        <>
-                          Drag slider or tap a milestone to unlock more of the song
-                        </>
-                      )}
+                    <span className="spotlight-points-award">
+                      +
+                      {(
+                        roundHistory[roundHistory.length - 1]?.pointsAwarded ?? 0
+                      ).toLocaleString()}{' '}
+                      pts
                     </span>
-                    <span className="curve-hint">Base: {baseCurvePoints.toLocaleString()} pts</span>
                   </div>
 
-                  {/* Custom Visual Progress + Scrubber */}
-                  <div className="scrubber-track-wrapper">
-                    <div className="scrubber-rail">
-                      <div
-                        className="scrubber-unlocked-fill"
-                        style={{ width: `${unlockedPercent}%` }}
-                      />
-                      {isPlaying && (
-                        <div
-                          className="scrubber-playhead-fill"
-                          style={{ width: `${playheadPercent}%` }}
+                  <div className="spotlight-stage">
+                    <div className={`spotlight-cover-wrap ${isPlaying ? 'playing' : ''}`}>
+                      {currentTrack.artworkUrl ? (
+                        <img
+                          src={currentTrack.artworkUrl}
+                          alt={currentTrack.title}
+                          className="spotlight-cover"
                         />
+                      ) : (
+                        <div className="spotlight-cover-fallback">
+                          <Disc3 className={isPlaying ? 'spin-slow' : ''} size={46} />
+                        </div>
                       )}
-                    </div>
-                    <input
-                      type="range"
-                      min={MIN_SNIPPET_SECONDS}
-                      max={MAX_SNIPPET_SECONDS}
-                      step={0.1}
-                      value={snippetDurationSec}
-                      onChange={(e) => handleScrubberChange(parseFloat(e.target.value), false)}
-                      className="scrubber-input-overlay"
-                      aria-label="Snippet duration in seconds"
-                    />
-                  </div>
-
-                  {/* Clickable Milestone Pills */}
-                  <div className="milestone-bar">
-                    {MILESTONE_SECONDS.map((sec) => {
-                      const isActive = Math.abs(snippetDurationSec - sec) < 0.05;
-                      const isUnlocked = sec <= maxUnlockedDurationSec;
-                      return (
-                        <button
-                          key={sec}
-                          type="button"
-                          className={`milestone-pill ${isActive ? 'current' : ''} ${
-                            isUnlocked ? 'unlocked' : ''
-                          }`}
-                          onClick={() => handleScrubberChange(sec, true)}
-                          title={`Set snippet to ${sec}s (${calculateLogarithmicBaseScore(sec).toLocaleString()} base pts) and play`}
-                        >
-                          {sec}s
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Search & Guess Input OR Round Reveal Card */}
-            {roundState === 'playing' ? (
-              <div className="guess-zone">
-                <div className="search-bar-container">
-                  <div className="search-field-box">
-                    <Search className="search-icon" size={19} />
-                    <input
-                      ref={searchInputRef}
-                      type="text"
-                      className="search-input"
-                      placeholder={`Search ${catalog.length} songs in your ${activeProvider.displayName} library...`}
-                      value={searchQuery}
-                      onFocus={() => setIsDropdownOpen(true)}
-                      onChange={(e) => {
-                        setSearchQuery(e.target.value);
-                        setSelectedSuggestionIdx(0);
-                        setIsDropdownOpen(true);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === 'ArrowDown') {
-                          e.preventDefault();
-                          setSelectedSuggestionIdx((i) =>
-                            Math.min(i + 1, Math.max(0, filteredSuggestions.length - 1))
-                          );
-                        } else if (e.key === 'ArrowUp') {
-                          e.preventDefault();
-                          setSelectedSuggestionIdx((i) => Math.max(0, i - 1));
-                        } else if (
-                          e.key === 'Enter' &&
-                          filteredSuggestions[selectedSuggestionIdx]
-                        ) {
-                          e.preventDefault();
-                          submitGuess(filteredSuggestions[selectedSuggestionIdx]);
-                        } else if (e.key === 'Escape') {
-                          setIsDropdownOpen(false);
-                        }
-                      }}
-                    />
-                    {searchQuery && (
                       <button
                         type="button"
-                        className="clear-search-btn"
-                        onClick={() => {
-                          setSearchQuery('');
-                          searchInputRef.current?.focus();
-                        }}
-                        aria-label="Clear search"
+                        className="spotlight-play-overlay"
+                        onClick={() => void handlePlayToggle()}
+                        aria-label={isPlaying ? 'Pause song' : 'Resume song'}
+                        title={isPlaying ? 'Pause playback' : 'Resume playback'}
                       >
-                        <X size={16} />
+                        {isPlaying ? <Square size={22} /> : <Play size={24} className="play-offset" />}
                       </button>
-                    )}
-                  </div>
+                    </div>
 
-                  <button
-                    type="button"
-                    className="btn-skip-round"
-                    onClick={handleGiveUp}
-                    title="Reveal the song and move to the next round"
-                  >
-                    <Flag size={15} />
-                    <span>Give Up</span>
-                  </button>
-                </div>
-
-                {/* Autocomplete Suggestions Dropdown */}
-                {isDropdownOpen && searchQuery.trim().length > 0 && (
-                  <div className="suggestions-popover" role="listbox">
-                    {filteredSuggestions.length > 0 ? (
-                      filteredSuggestions.map((track, idx) => (
-                        <button
-                          key={track.id}
-                          type="button"
-                          role="option"
-                          aria-selected={idx === selectedSuggestionIdx}
-                          className={`suggestion-row ${
-                            idx === selectedSuggestionIdx ? 'selected' : ''
-                          }`}
-                          onMouseEnter={() => setSelectedSuggestionIdx(idx)}
-                          onMouseDown={(e) => {
-                            e.preventDefault();
-                            submitGuess(track);
-                          }}
-                        >
-                          {track.artworkUrl ? (
-                            <img src={track.artworkUrl} alt="" className="suggestion-art" />
-                          ) : (
-                            <div className="suggestion-art-fallback">
-                              <Music2 size={15} />
-                            </div>
-                          )}
-                          <div className="suggestion-text">
-                            <span className="suggestion-title">{track.title}</span>
-                            <span className="suggestion-artist">{track.artist}</span>
-                          </div>
-                          <span className="suggestion-submit-hint">Guess ↵</span>
-                        </button>
-                      ))
-                    ) : (
-                      <div className="suggestions-empty">
-                        No matching tracks found in your cached library.
+                    <div className="spotlight-meta">
+                      <div className="now-playing-indicator">
+                        <span className={`eq-bars ${isPlaying ? 'active' : ''}`}>
+                          <i />
+                          <i />
+                          <i />
+                        </span>
+                        <span>
+                          {isPlaying
+                            ? 'Now Playing — Continues until you click Next Song'
+                            : 'Playback Paused — Click cover to resume'}
+                        </span>
                       </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            ) : (
-              /* Round Result Reveal Card */
-              currentTrack && (
-                <div className={`reveal-card ${roundState}`}>
-                  <div className="reveal-song-row">
-                    {currentTrack.artworkUrl ? (
-                      <img
-                        src={currentTrack.artworkUrl}
-                        alt={currentTrack.title}
-                        className="reveal-cover"
-                      />
-                    ) : (
-                      <div className="reveal-cover-fallback">
-                        <Disc3 size={28} />
-                      </div>
-                    )}
-                    <div className="reveal-details">
-                      <div className="reveal-status-pill">
-                        {roundState === 'won' ? (
-                          <>
-                            <CheckCircle2 size={16} />
-                            <span>
-                              Nailed it at {effectiveScoringDuration.toFixed(1)}s! +
-                              {roundHistory[
-                                roundHistory.length - 1
-                              ]?.pointsAwarded.toLocaleString()}{' '}
-                              pts
-                            </span>
-                          </>
-                        ) : (
-                          <>
-                            <XCircle size={16} />
-                            <span>Song Revealed · 0 pts</span>
-                          </>
-                        )}
-                      </div>
-                      <h3 className="reveal-title">{currentTrack.title}</h3>
-                      <p className="reveal-artist">{currentTrack.artist}</p>
+                      <h2 className="spotlight-title">{currentTrack.title}</h2>
+                      <p className="spotlight-artist">{currentTrack.artist}</p>
                     </div>
                   </div>
 
-                  <div className="reveal-cta-row">
+                  <div className="spotlight-actions">
                     <button
                       type="button"
                       className="btn-secondary"
@@ -1024,11 +1080,12 @@ export function App() {
                     </button>
                     <button
                       type="button"
-                      className="btn-primary btn-next-song"
+                      autoFocus
+                      className="btn-primary btn-next-song-lg"
                       onClick={() => void startNewRound()}
                     >
                       <span>Next Song</span>
-                      <ArrowRight size={17} />
+                      <ArrowRight size={18} />
                     </button>
                   </div>
                 </div>

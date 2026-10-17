@@ -688,6 +688,50 @@ export class SpotifyProvider implements MusicProvider {
     });
   }
 
+  public async playFullTrack(track: Track, startOffsetSec = 0): Promise<void> {
+    if (this.activeTimerId !== null) {
+      window.clearTimeout(this.activeTimerId);
+      this.activeTimerId = null;
+    }
+    if (this.activeRafId !== null) {
+      cancelAnimationFrame(this.activeRafId);
+      this.activeRafId = null;
+    }
+    this.activeSdkStateCallback = null;
+
+    if (this.strategy === 'youtube-iframe-fallback') {
+      const videoId = await this.resolveYouTubeVideoId(track);
+      await this.youtubeFallback.playFullTrack({ ...track, videoId }, startOffsetSec);
+      return;
+    }
+
+    const deviceId = await this.initializeWebPlaybackSdk();
+    const token = await this.ensureValidAccessToken();
+    await this.sdkPlayer?.activateElement?.();
+
+    const state = await this.sdkPlayer?.getCurrentState();
+    if (state && !state.paused && state.track_window?.current_track?.id === track.id) {
+      // Already playing this track
+      return;
+    }
+
+    const spotifyUri = track.spotifyUri || `spotify:track:${track.id}`;
+    await fetch(
+      `https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(deviceId)}`,
+      {
+        method: 'PUT',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          uris: [spotifyUri],
+          position_ms: Math.max(0, Math.round(startOffsetSec * 1000)),
+        }),
+      }
+    );
+  }
+
   public stopPlayback(): void {
     if (this.activeTimerId !== null) {
       window.clearTimeout(this.activeTimerId);

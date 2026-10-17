@@ -65,6 +65,9 @@ export interface MusicProvider {
   /** Plays a precise audio snippet using millisecond timers */
   playSnippet(track: Track, options: SnippetPlaybackOptions): Promise<void>;
 
+  /** Plays the track continuously without snippet timer cutoff (e.g., on round reveal) */
+  playFullTrack(track: Track, startOffsetSec?: number): Promise<void>;
+
   /** Immediately stops/pauses active playback and clears snippet timers */
   stopPlayback(): void;
 

@@ -542,6 +542,47 @@ export class YouTubeMusicProvider implements MusicProvider {
     });
   }
 
+  public async playFullTrack(track: Track, startOffsetSec = 0): Promise<void> {
+    await this.initializePlayer();
+    if (!this.player) {
+      throw new Error('YouTube player is not initialized.');
+    }
+
+    // Clear any active snippet stop-timers so playback continues uninterrupted
+    if (this.activeTimerId !== null) {
+      window.clearTimeout(this.activeTimerId);
+      this.activeTimerId = null;
+    }
+    if (this.activeRafId !== null) {
+      cancelAnimationFrame(this.activeRafId);
+      this.activeRafId = null;
+    }
+    this.activeStateListener = null;
+    this.activeErrorListener = null;
+
+    const videoId = track.videoId || track.id;
+    const currentState = this.player.getPlayerState?.();
+
+    if (this.cuedVideoId === videoId && currentState === window.YT?.PlayerState.PLAYING) {
+      // Already playing this song — keep playing seamlessly
+      return;
+    }
+
+    if (this.cuedVideoId !== videoId) {
+      this.cuedVideoId = videoId;
+      this.player.loadVideoById({
+        videoId,
+        startSeconds: startOffsetSec,
+      });
+    } else {
+      const currentTime = this.player.getCurrentTime?.() ?? 0;
+      if (currentTime < startOffsetSec) {
+        this.player.seekTo(startOffsetSec, true);
+      }
+      this.player.playVideo();
+    }
+  }
+
   public stopPlayback(): void {
     if (this.activeTimerId !== null) {
       window.clearTimeout(this.activeTimerId);
