@@ -65,6 +65,7 @@ export interface YTPlayerInstance {
   getCurrentTime: () => number;
   getDuration: () => number;
   getPlayerState: () => number;
+  getVideoUrl?: () => string;
   setVolume: (volume: number) => void;
   destroy: () => void;
 }
@@ -481,12 +482,13 @@ export class YouTubeMusicProvider implements MusicProvider {
           window.clearTimeout(timeout);
           this.activeStateListener = null;
           this.activeErrorListener = null;
+          this.cuedVideoId = videoId;
           const dur = this.player?.getDuration();
           resolve({ durationSec: dur && dur > 0 ? dur : track.durationSec });
         }
       };
 
-      this.cuedVideoId = videoId;
+      this.cuedVideoId = null;
       this.player!.cueVideoById({ videoId, startSeconds: 0 });
     });
   }
@@ -520,6 +522,7 @@ export class YouTubeMusicProvider implements MusicProvider {
       const startPrecisionTimer = () => {
         if (snippetStarted) return;
         snippetStarted = true;
+        this.cuedVideoId = videoId;
         const startPerf = performance.now();
 
         const tick = () => {
@@ -553,7 +556,11 @@ export class YouTubeMusicProvider implements MusicProvider {
         }
       };
 
-      if (this.cuedVideoId !== videoId) {
+      const loadedUrl = this.player?.getVideoUrl?.() || '';
+      const isAlreadyLoaded =
+        this.cuedVideoId === videoId && (!loadedUrl || loadedUrl.includes(videoId));
+
+      if (!isAlreadyLoaded) {
         this.cuedVideoId = videoId;
         this.player!.loadVideoById({
           videoId,
@@ -586,13 +593,16 @@ export class YouTubeMusicProvider implements MusicProvider {
 
     const videoId = track.videoId || track.id;
     const currentState = this.player.getPlayerState?.();
+    const loadedUrl = this.player.getVideoUrl?.() || '';
+    const isAlreadyLoaded =
+      this.cuedVideoId === videoId && (!loadedUrl || loadedUrl.includes(videoId));
 
-    if (this.cuedVideoId === videoId && currentState === window.YT?.PlayerState.PLAYING) {
+    if (isAlreadyLoaded && currentState === window.YT?.PlayerState.PLAYING) {
       // Already playing this song — keep playing seamlessly
       return;
     }
 
-    if (this.cuedVideoId !== videoId) {
+    if (!isAlreadyLoaded) {
       this.cuedVideoId = videoId;
       this.player.loadVideoById({
         videoId,

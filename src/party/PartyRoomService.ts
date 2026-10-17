@@ -94,9 +94,11 @@ export interface PartyRoomStatePayload {
   roomCode: string;
   updatedAtMs: number;
   status: 'lobby' | 'playing' | 'revealed' | 'summary';
+  partyLocationMode?: 'local' | 'remote';
   hostName: string;
   sharedMatchesCount: number;
   totalTracksCount: number;
+  roundId?: string;
   roundNumber: number;
   roundStartedAtMs: number;
   startOffsetSec: number;
@@ -1095,6 +1097,7 @@ export class PartyRoomService {
     }
     this.guestSockets = [];
     this.guestRoomCode = null;
+    this.latestRoomStateTs = 0;
   }
 
   public destroyHost(clearSavedCode = true): void {

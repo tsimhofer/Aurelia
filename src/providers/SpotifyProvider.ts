@@ -546,7 +546,7 @@ export class SpotifyProvider implements MusicProvider {
     }
   }
 
-  private async resolveYouTubeVideoId(track: Track): Promise<string> {
+  public async resolveYouTubeVideoId(track: Track): Promise<string> {
     if (track.videoId) {
       return track.videoId;
     }

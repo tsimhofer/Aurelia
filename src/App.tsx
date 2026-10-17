@@ -130,7 +130,7 @@ function loadInitialPartyMembers(): PartyMember[] {
       if (Array.isArray(parsed)) {
         return parsed.map((m) => ({
           ...m,
-          isReady: typeof m.isReady === 'boolean' ? m.isReady : Boolean(m.isHost),
+          isReady: false,
         }));
       }
     }
@@ -339,7 +339,9 @@ export function App() {
   const [guestIsReady, setGuestIsReady] = useState<boolean>(false);
   const [guestRoomState, setGuestRoomState] = useState<PartyRoomStatePayload | null>(null);
   const [guestCatalog, setGuestCatalog] = useState<PartyCatalogItem[]>([]);
-  const [guestSyncedRoundNum, setGuestSyncedRoundNum] = useState<number>(0);
+  const [guestSyncedRoundKey, setGuestSyncedRoundKey] = useState<string>('');
+  const [currentRoundId, setCurrentRoundId] = useState<string>('');
+  const [isPreparingRound, setIsPreparingRound] = useState<boolean>(false);
 
   const handleHostNameChange = (val: string) => {
     setHostName(val);
@@ -387,10 +389,9 @@ export function App() {
   );
 
   const isPartyMode = gameMode === 'party';
-  const isOnlinePartyHost = isPartyMode && partyLocationMode === 'remote' && partyTab === 'host';
+  const isOnlinePartyHost = isPartyMode && partyTab === 'host';
   const isRemoteGuestPlaying =
     isPartyMode &&
-    partyLocationMode === 'remote' &&
     partyTab === 'join' &&
     Boolean(
       guestRoomState &&
@@ -500,7 +501,7 @@ export function App() {
   };
 
   useEffect(() => {
-    if (savedSession?.currentTrack) {
+    if (savedSession?.currentTrack && !(savedSession.gameMode === 'party' && savedSession.isPartyLobbyOpen)) {
       const provider = getPlaybackProviderForTrack(savedSession.currentTrack);
       void provider.cueTrack(savedSession.currentTrack).catch(() => {});
     }
@@ -513,42 +514,71 @@ export function App() {
     setIsPlaying(false);
   }, []);
 
-  // When a Remote Guest receives a new round or revealed state from the Host,
-  // cue the track on the Guest's own music player so the Guest controls their own snippet playback!
+  // When a Guest is in the lobby or receives a new round / track from the Host,
+  // guarantee 100% synchronization to the Host's exact currentTrack, videoId, and startOffsetSec!
   useEffect(() => {
+    if (isPartyMode && partyTab === 'join' && guestRoomState?.status === 'lobby') {
+      if (guestSyncedRoundKey !== '') {
+        stopAllPlayback();
+        setGuestSyncedRoundKey('');
+        setCurrentTrack(null);
+        setGuesses([]);
+        setRoundState('playing');
+      }
+      return;
+    }
+
     if (!isRemoteGuestPlaying || !guestRoomState?.currentTrack) return;
 
     const incomingTrack = guestRoomState.currentTrack;
-    if (guestRoomState.roundNumber !== guestSyncedRoundNum) {
+    const incomingOffset = guestRoomState.startOffsetSec ?? 0;
+    const roundIdentity = `${guestRoomState.roundId || guestRoomState.roundNumber}::${incomingTrack.id}`;
+    const fullSyncKey = `${roundIdentity}::${incomingTrack.videoId ?? ''}::${incomingOffset}`;
+
+    if (fullSyncKey !== guestSyncedRoundKey) {
+      const isNewRoundTrack = !guestSyncedRoundKey.startsWith(`${roundIdentity}::`);
       stopAllPlayback();
-      setGuestSyncedRoundNum(guestRoomState.roundNumber);
+      setGuestSyncedRoundKey(fullSyncKey);
+      currentTrackRef.current = incomingTrack;
       setCurrentTrack(incomingTrack);
-      setStartOffsetSec(guestRoomState.startOffsetSec ?? 0);
-      setSnippetDurationSec(MIN_SNIPPET_SECONDS);
-      setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
-      setGuesses([]);
-      setRoundState('playing');
-      setSearchQuery('');
-      setIsDropdownOpen(false);
+      setStartOffsetSec(incomingOffset);
+
+      if (isNewRoundTrack) {
+        setSnippetDurationSec(MIN_SNIPPET_SECONDS);
+        maxUnlockedRef.current = MIN_SNIPPET_SECONDS;
+        setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
+        setGuesses([]);
+        roundStateRef.current = 'playing';
+        setRoundState('playing');
+        setSearchQuery('');
+        setIsDropdownOpen(false);
+      }
 
       const provider = getPlaybackProviderForTrack(incomingTrack);
       void provider.cueTrack(incomingTrack).catch(() => {});
     } else if (guestRoomState.status === 'revealed' && roundState === 'playing') {
       const myEntry = guestRoomState.leaderboard.find((e) => e.memberId === guestMemberId);
       const nextSt = myEntry?.roundStatus === 'correct' ? 'won' : 'gave-up';
+      roundStateRef.current = nextSt;
       setRoundState(nextSt);
-      setIsPlaying(true);
-      const provider = getPlaybackProviderForTrack(incomingTrack);
-      void provider.playFullTrack(incomingTrack, guestRoomState.startOffsetSec ?? 0).catch(() => {
-        setIsPlaying(false);
-      });
+      const effectiveLocMode = guestRoomState.partyLocationMode ?? partyLocationMode;
+      if (effectiveLocMode === 'remote') {
+        setIsPlaying(true);
+        const provider = getPlaybackProviderForTrack(incomingTrack);
+        void provider.playFullTrack(incomingTrack, incomingOffset).catch(() => {
+          setIsPlaying(false);
+        });
+      }
     }
   }, [
+    isPartyMode,
+    partyTab,
     isRemoteGuestPlaying,
     guestRoomState,
-    guestSyncedRoundNum,
+    guestSyncedRoundKey,
     roundState,
     guestMemberId,
+    partyLocationMode,
     stopAllPlayback,
   ]);
 
@@ -583,9 +613,9 @@ export function App() {
     });
   }, [partyMembers, roundPlayerStates, partyScores]);
 
-  // Broadcast live room state from Host to all connected Remote Guests
+  // Broadcast live room state from Host to all connected Guests (only when round track is ready!)
   useEffect(() => {
-    if (!isOnlinePartyHost || !hostRoomCode) return;
+    if (!isOnlinePartyHost || !hostRoomCode || isPreparingRound) return;
 
     const status: PartyRoomStatePayload['status'] = isPartyLobbyOpen
       ? 'lobby'
@@ -600,16 +630,19 @@ export function App() {
       roomCode: hostRoomCode,
       updatedAtMs: Date.now(),
       status,
+      partyLocationMode,
       hostName: hostName.trim() || 'Host',
       sharedMatchesCount: mergedPartyPool.sharedMatchesCount,
       totalTracksCount: mergedPartyPool.totalUniqueCount,
-      roundNumber: roundHistory.length + (roundState === 'playing' ? 1 : 0),
+      roundId: status === 'lobby' ? '' : currentRoundId,
+      roundNumber:
+        status === 'lobby' ? 0 : roundHistory.length + (roundState === 'playing' ? 1 : 0),
       roundStartedAtMs: 0,
-      startOffsetSec,
+      startOffsetSec: status === 'lobby' ? 0 : startOffsetSec,
       snippetDurationSec,
       maxUnlockedDurationSec,
       isPlayingAudio: isPlaying,
-      currentTrack,
+      currentTrack: status === 'lobby' ? null : currentTrack,
       leaderboard: partyLeaderboard,
     };
 
@@ -617,12 +650,15 @@ export function App() {
   }, [
     isOnlinePartyHost,
     hostRoomCode,
+    isPreparingRound,
     isPartyLobbyOpen,
+    partyLocationMode,
     view,
     roundState,
     hostName,
     mergedPartyPool.sharedMatchesCount,
     mergedPartyPool.totalUniqueCount,
+    currentRoundId,
     roundHistory.length,
     startOffsetSec,
     snippetDurationSec,
@@ -639,22 +675,35 @@ export function App() {
     }
   }, [isOnlinePartyHost, mergedPartyPool.tracks]);
 
+  const resetAllPartyMembersToUnready = useCallback(() => {
+    const current = partyMembersRef.current;
+    if (current.length === 0) return;
+    const updated = current.map((m) => ({ ...m, isReady: false }));
+    partyMembersRef.current = updated;
+    setPartyMembers(updated);
+  }, []);
+
   const cancelCurrentGame = useCallback(() => {
     stopAllPlayback();
     setPlaybackElapsedSec(0);
     setErrorMessage(null);
+    currentTrackRef.current = null;
     setCurrentTrack(null);
+    setCurrentRoundId('');
     setStartOffsetSec(0);
     setSnippetDurationSec(MIN_SNIPPET_SECONDS);
+    maxUnlockedRef.current = MIN_SNIPPET_SECONDS;
     setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
     setGuesses([]);
+    roundStateRef.current = 'playing';
     setRoundState('playing');
     setRoundHistory([]);
     setUsedTrackIds(new Set());
     setMemberPickCounts({});
     setPartyScores({});
+    roundPlayerStatesRef.current = {};
     setRoundPlayerStates({});
-    setGuestSyncedRoundNum(0);
+    setGuestSyncedRoundKey('');
     setSearchQuery('');
     setIsDropdownOpen(false);
     setView('quiz');
@@ -676,7 +725,7 @@ export function App() {
       const cleanName = name.trim() || `Player ${currentList.length + 1}`;
       const explicitId = options?.explicitId;
       const isHost = options?.isHost ?? false;
-      const defaultReady = options?.isReady ?? true;
+      const defaultReady = options?.isReady ?? false;
 
       const existingIdx = currentList.findIndex(
         (m) =>
@@ -723,7 +772,7 @@ export function App() {
     []
   );
 
-  // Reveal the active Online Party round when all players finish or Host clicks Reveal
+  // Reveal the active Party round when all players finish or Host clicks Reveal
   const revealPartyRound = useCallback(
     (didAnyoneWin: boolean) => {
       const track = currentTrackRef.current;
@@ -764,7 +813,7 @@ export function App() {
     [startOffsetSec]
   );
 
-  // Process a guess in Online Party Mode (Points based strictly on unlocked snippet duration, never counting down over time!)
+  // Process a guess in Party Mode (Points based strictly on unlocked snippet duration, never counting down over time!)
   const handleProcessPartyGuess = useCallback(
     (guess: PartyGuessPayload) => {
       const track = currentTrackRef.current;
@@ -854,7 +903,7 @@ export function App() {
                 {
                   explicitId: guestPayload.memberId,
                   isHost: false,
-                  isReady: false, // Remote guests explicitly mark Ready
+                  isReady: false, // Guests explicitly mark Ready before game starts
                 }
               );
               const merged = mergePartyCatalogs(updatedMembers);
@@ -896,22 +945,14 @@ export function App() {
   );
 
   useEffect(() => {
-    if (
-      (gameMode === 'party' && partyLocationMode === 'remote' && partyTab === 'host') ||
-      getSavedHostRoomCode()
-    ) {
+    if ((gameMode === 'party' && partyTab === 'host') || getSavedHostRoomCode()) {
       void ensureHostingRoom(false);
     }
-  }, [gameMode, partyLocationMode, partyTab, ensureHostingRoom]);
+  }, [gameMode, partyTab, ensureHostingRoom]);
 
-  // Connect guest listener automatically when in Remote Join mode with a valid 5-char code
+  // Connect guest listener automatically when in Join mode with a valid 5-char code
   useEffect(() => {
-    if (
-      gameMode === 'party' &&
-      partyLocationMode === 'remote' &&
-      partyTab === 'join' &&
-      joinRoomCode.trim().length >= 5
-    ) {
+    if (gameMode === 'party' && partyTab === 'join' && joinRoomCode.trim().length >= 5) {
       partyRoomRef.current?.connectAsGuest(joinRoomCode, {
         onRoomState: (state) => {
           setGuestRoomState(state);
@@ -925,32 +966,97 @@ export function App() {
         },
       });
     }
-  }, [gameMode, partyLocationMode, partyTab, joinRoomCode, guestMemberId]);
+  }, [gameMode, partyTab, joinRoomCode, guestMemberId]);
 
-  const startNewRound = async (pool: Track[] = catalog, forcePartyMode = isPartyMode) => {
+  const startNewRound = async (
+    pool: Track[] = catalog,
+    forcePartyMode = isPartyMode,
+    overrideUsedIds?: Set<string>,
+    overridePickCounts?: Record<string, number>,
+    explicitRoundNum?: number
+  ) => {
     if (pool.length === 0) return;
     stopAllPlayback();
     setPlaybackElapsedSec(0);
     setErrorMessage(null);
+    setIsPreparingRound(true);
 
-    let chosen: Track;
-    if (forcePartyMode) {
-      const selection = selectNextPartyTrack(
-        pool,
-        usedTrackIds,
-        memberPickCounts,
-        partyMembersRef.current
-      );
-      chosen = selection.chosen;
-      setMemberPickCounts(selection.updatedPickCounts);
-    } else {
-      const unplayed = pool.filter((t) => !usedTrackIds.has(t.id));
-      const candidatePool = unplayed.length > 0 ? unplayed : pool;
-      chosen = candidatePool[Math.floor(Math.random() * candidatePool.length)];
+    const activeUsedIds = new Set(overrideUsedIds ?? usedTrackIds);
+    let activePickCounts = { ...(overridePickCounts ?? memberPickCounts) };
+    let finalChosen: Track | null = null;
+    let finalOffsetSec = 0;
+
+    // Try up to 3 candidate tracks in case a track's YouTube video is unembeddable
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let candidate: Track;
+      if (forcePartyMode) {
+        const selection = selectNextPartyTrack(
+          pool,
+          activeUsedIds,
+          activePickCounts,
+          partyMembersRef.current
+        );
+        candidate = { ...selection.chosen };
+        activePickCounts = selection.updatedPickCounts;
+      } else {
+        const unplayed = pool.filter((t) => !activeUsedIds.has(t.id));
+        const candidatePool = unplayed.length > 0 ? unplayed : pool;
+        candidate = { ...candidatePool[Math.floor(Math.random() * candidatePool.length)] };
+      }
+
+      try {
+        // Always resolve a YouTube videoId for Spotify tracks up front in Party Mode (or YouTube fallback)
+        // so every player hears the exact same audio source!
+        if (
+          !candidate.videoId &&
+          (forcePartyMode || spotifyStrategy === 'youtube-iframe-fallback') &&
+          spotifyProviderRef.current
+        ) {
+          const resolvedVideoId = await spotifyProviderRef.current.resolveYouTubeVideoId(candidate);
+          candidate = { ...candidate, videoId: resolvedVideoId };
+        }
+
+        const playbackProvider = getPlaybackProviderForTrack(candidate);
+        const { durationSec } = await playbackProvider.cueTrack(candidate);
+        if (candidate.videoId) {
+          candidate = { ...candidate };
+        }
+
+        if (offsetMode === 'random' && durationSec && durationSec > 45) {
+          const safeMaxStart = Math.max(0, Math.floor(durationSec - 35));
+          finalOffsetSec = Math.floor(Math.random() * safeMaxStart);
+        } else {
+          finalOffsetSec = 0;
+        }
+
+        finalChosen = candidate;
+        break;
+      } catch (err) {
+        activeUsedIds.add(candidate.id);
+        if (attempt === 2) {
+          finalChosen = candidate;
+          finalOffsetSec = 0;
+          setErrorMessage(err instanceof Error ? err.message : 'Unable to cue track.');
+        }
+      }
     }
 
-    currentTrackRef.current = chosen;
-    setCurrentTrack(chosen);
+    if (!finalChosen) {
+      setIsPreparingRound(false);
+      return;
+    }
+
+    if (forcePartyMode) {
+      setMemberPickCounts(activePickCounts);
+    }
+
+    const roundNum = explicitRoundNum ?? roundHistory.length + 1;
+    const nextRoundId = `r-${roundNum}-${finalChosen.id}-${Date.now()}`;
+
+    currentTrackRef.current = finalChosen;
+    setCurrentTrack(finalChosen);
+    setCurrentRoundId(nextRoundId);
+    setStartOffsetSec(finalOffsetSec);
     setSnippetDurationSec(MIN_SNIPPET_SECONDS);
     maxUnlockedRef.current = MIN_SNIPPET_SECONDS;
     setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
@@ -961,26 +1067,7 @@ export function App() {
     setRoundPlayerStates({});
     setSearchQuery('');
     setIsDropdownOpen(false);
-
-    try {
-      const playbackProvider = getPlaybackProviderForTrack(chosen);
-      const { durationSec } = await playbackProvider.cueTrack(chosen);
-      // If SpotifyProvider resolved a YouTube videoId on cueTrack, keep it on currentTrack so Remote Guests can play it directly
-      if (chosen.videoId && currentTrackRef.current?.id === chosen.id) {
-        const enriched = { ...chosen };
-        currentTrackRef.current = enriched;
-        setCurrentTrack(enriched);
-      }
-      if (offsetMode === 'random' && durationSec && durationSec > 45) {
-        const safeMaxStart = Math.max(0, Math.floor(durationSec - 35));
-        setStartOffsetSec(Math.floor(Math.random() * safeMaxStart));
-      } else {
-        setStartOffsetSec(0);
-      }
-    } catch (err) {
-      setStartOffsetSec(0);
-      setErrorMessage(err instanceof Error ? err.message : 'Unable to cue track.');
-    }
+    setIsPreparingRound(false);
   };
 
   // Switch between YouTube Music, Spotify, and Party Mode — cancels current game immediately
@@ -988,6 +1075,7 @@ export function App() {
     if (nextMode === gameMode) {
       if (nextMode === 'party' && !isPartyLobbyOpen) {
         cancelCurrentGame();
+        resetAllPartyMembersToUnready();
         setIsPartyLobbyOpen(true);
       }
       return;
@@ -998,6 +1086,7 @@ export function App() {
     setGameMode(nextMode);
 
     if (nextMode === 'party') {
+      resetAllPartyMembersToUnready();
       setIsPartyLobbyOpen(true);
     } else {
       setIsPartyLobbyOpen(false);
@@ -1011,7 +1100,7 @@ export function App() {
       const cached = nextProvider.getCachedCatalog();
       setSoloCatalog(cached);
       if (cached.length > 0) {
-        void startNewRound(cached, false);
+        void startNewRound(cached, false, new Set(), {}, 1);
       }
     }
   };
@@ -1019,14 +1108,9 @@ export function App() {
   const handleSelectPartyLocationMode = (nextLocMode: PartyLocationMode) => {
     if (nextLocMode === partyLocationMode) return;
     cancelCurrentGame();
+    resetAllPartyMembersToUnready();
     setPartyLocationMode(nextLocMode);
     setIsPartyLobbyOpen(true);
-    if (nextLocMode === 'local') {
-      // In Same-Room Local mode, mark all members as Ready automatically
-      const updated = partyMembersRef.current.map((m) => ({ ...m, isReady: true }));
-      partyMembersRef.current = updated;
-      setPartyMembers(updated);
-    }
   };
 
   const handleOffsetModeChange = (nextOffsetMode: OffsetMode) => {
@@ -1108,15 +1192,15 @@ export function App() {
                 addOrUpdatePartyMember(pending.playerName, 'spotify', tracks, {
                   explicitId: 'host-player',
                   isHost: true,
-                  isReady: true,
+                  isReady: false,
                 });
               } else if (pending.mode === 'local-add') {
                 addOrUpdatePartyMember(pending.playerName, 'spotify', tracks, {
                   isHost: false,
-                  isReady: true,
+                  isReady: false,
                 });
               } else if (pending.mode === 'remote-join' && pending.roomCode) {
-                setPartyLocationMode('remote');
+                setPartyLocationMode(pending.locationMode || 'remote');
                 setPartyTab('join');
                 setJoinRoomCode(pending.roomCode);
                 setNewPlayerName(pending.playerName);
@@ -1180,7 +1264,7 @@ export function App() {
           'Connected successfully, but no liked songs were found in your library.'
         );
       } else if (!isPartyMode) {
-        await startNewRound(tracks, false);
+        await startNewRound(tracks, false, new Set(), {}, 1);
       }
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : 'Failed to load library.');
@@ -1203,7 +1287,7 @@ export function App() {
         addOrUpdatePartyMember(cleanName, newPlayerProvider, cached, {
           explicitId: asHost ? 'host-player' : undefined,
           isHost: asHost,
-          isReady: true,
+          isReady: false,
         });
         if (!asHost) handlePlayerNameChange('');
         return;
@@ -1241,7 +1325,7 @@ export function App() {
         addOrUpdatePartyMember(cleanName, newPlayerProvider, tracks, {
           explicitId: asHost ? 'host-player' : undefined,
           isHost: asHost,
-          isReady: true,
+          isReady: false,
         });
         if (!asHost) handlePlayerNameChange('');
       }
@@ -1252,7 +1336,7 @@ export function App() {
     }
   };
 
-  // Party Mode: Remote Guest connects & sends their library to Host
+  // Party Mode: Guest connects & sends their library to Host
   const handleGuestJoinAndSend = async (useCached = false) => {
     const cleanCode = joinRoomCode.trim().toUpperCase();
     if (!cleanCode || cleanCode.length < 4) {
@@ -1302,7 +1386,7 @@ export function App() {
         localStorage.setItem(
           STORAGE_KEY_PENDING_PARTY_ACTION,
           JSON.stringify({
-            locationMode: 'remote',
+            locationMode: partyLocationMode,
             mode: 'remote-join',
             playerName: cleanName,
             provider: 'spotify',
@@ -1352,6 +1436,25 @@ export function App() {
     setPartyMembers(updated);
   };
 
+  const handleHostReadyAllLocal = () => {
+    const allAlreadyReady = partyMembersRef.current.every((m) => m.isReady);
+    const updated = partyMembersRef.current.map((m) => ({
+      ...m,
+      isReady: !allAlreadyReady,
+    }));
+    partyMembersRef.current = updated;
+    setPartyMembers(updated);
+  };
+
+  const handleStartPartyQuiz = async () => {
+    if (!allPartyMembersReady || mergedPartyPool.tracks.length === 0 || isPreparingRound) {
+      return;
+    }
+    cancelCurrentGame();
+    await startNewRound(mergedPartyPool.tracks, true, new Set(), {}, 1);
+    setIsPartyLobbyOpen(false);
+  };
+
   const handleShareOrCopyInvite = async () => {
     if (!hostRoomCode) return;
     const inviteUrl = `${window.location.origin}${window.location.pathname}?party=${hostRoomCode}`;
@@ -1397,9 +1500,7 @@ export function App() {
     partyMembersRef.current = [];
     setPartyMembers([]);
     setIsPartyLobbyOpen(true);
-    if (partyLocationMode === 'remote') {
-      void ensureHostingRoom(true);
-    }
+    void ensureHostingRoom(true);
   };
 
   const handleDisconnect = () => {
@@ -1409,8 +1510,17 @@ export function App() {
     setIsSettingsOpen(false);
   };
 
+  // In Remote Guest mode, always bind directly to the Host's broadcast currentTrack and startOffsetSec
+  // so it is impossible for a Guest to ever play or guess against a different song!
+  const effectiveTrack = isRemoteGuestPlaying
+    ? guestRoomState?.currentTrack ?? currentTrack
+    : currentTrack;
+  const effectiveStartOffsetSec = isRemoteGuestPlaying
+    ? guestRoomState?.startOffsetSec ?? startOffsetSec
+    : startOffsetSec;
+
   const triggerPlayDuration = async (targetDurationSec: number) => {
-    if (!currentTrack) return;
+    if (!effectiveTrack) return;
     setErrorMessage(null);
     setIsPlaying(true);
     setPlaybackElapsedSec(0);
@@ -1418,9 +1528,9 @@ export function App() {
     setMaxUnlockedDurationSec((prev) => Math.max(prev, targetDurationSec));
 
     try {
-      const playbackProvider = getPlaybackProviderForTrack(currentTrack);
-      await playbackProvider.playSnippet(currentTrack, {
-        startOffsetSec,
+      const playbackProvider = getPlaybackProviderForTrack(effectiveTrack);
+      await playbackProvider.playSnippet(effectiveTrack, {
+        startOffsetSec: effectiveStartOffsetSec,
         durationSec: targetDurationSec,
         onProgress: (elapsed) => setPlaybackElapsedSec(elapsed),
         onComplete: () => {
@@ -1438,7 +1548,7 @@ export function App() {
   };
 
   const handlePlayToggle = async () => {
-    if (!currentTrack) return;
+    if (!effectiveTrack) return;
     if (isPlaying) {
       stopAllPlayback();
       return;
@@ -1446,8 +1556,8 @@ export function App() {
     if (roundState !== 'playing') {
       setIsPlaying(true);
       try {
-        const playbackProvider = getPlaybackProviderForTrack(currentTrack);
-        await playbackProvider.playFullTrack(currentTrack, startOffsetSec);
+        const playbackProvider = getPlaybackProviderForTrack(effectiveTrack);
+        await playbackProvider.playFullTrack(effectiveTrack, effectiveStartOffsetSec);
       } catch (err) {
         setIsPlaying(false);
         setErrorMessage(err instanceof Error ? err.message : 'Playback error');
@@ -1466,7 +1576,7 @@ export function App() {
       maxUnlockedRef.current = Math.max(maxUnlockedRef.current, clamped);
       setMaxUnlockedDurationSec((prev) => Math.max(prev, clamped));
     }
-    if (autoPlay && currentTrack) {
+    if (autoPlay && effectiveTrack) {
       void triggerPlayDuration(clamped);
     }
   };
@@ -1507,15 +1617,15 @@ export function App() {
 
   // Submit a guess (In every mode, uses the player's own unlocked snippet duration!)
   const submitGuess = (guessedItem: PartyCatalogItem) => {
-    if (!currentTrack || roundState !== 'playing') return;
+    if (!effectiveTrack || roundState !== 'playing') return;
 
     setSearchQuery('');
     setIsDropdownOpen(false);
 
     const isCorrect =
-      guessedItem.id === currentTrack.id ||
-      (guessedItem.title.toLowerCase() === currentTrack.title.toLowerCase() &&
-        guessedItem.artist.toLowerCase() === currentTrack.artist.toLowerCase());
+      guessedItem.id === effectiveTrack.id ||
+      (guessedItem.title.toLowerCase() === effectiveTrack.title.toLowerCase() &&
+        guessedItem.artist.toLowerCase() === effectiveTrack.artist.toLowerCase());
 
     const usedDur = Math.max(snippetDurationSec, maxUnlockedDurationSec);
     const nowMs = Date.now();
@@ -1531,7 +1641,7 @@ export function App() {
     const updatedGuesses = [...guesses, nextGuess];
     setGuesses(updatedGuesses);
 
-    // 1. Remote Guest in Online Party Mode
+    // 1. Remote Guest in Party Mode
     if (isRemoteGuestPlaying && guestRoomState) {
       partyRoomRef.current?.sendGuestGuess(joinRoomCode, {
         guessId: `g-${guestMemberId}-${nowMs}`,
@@ -1547,17 +1657,18 @@ export function App() {
         snippetDurationSec: usedDur,
       });
 
-      if (isCorrect) {
+      const effectiveLocMode = guestRoomState.partyLocationMode ?? partyLocationMode;
+      if (isCorrect && effectiveLocMode === 'remote') {
         setIsPlaying(true);
-        const playbackProvider = getPlaybackProviderForTrack(currentTrack);
-        void playbackProvider.playFullTrack(currentTrack, startOffsetSec).catch(() => {
+        const playbackProvider = getPlaybackProviderForTrack(effectiveTrack);
+        void playbackProvider.playFullTrack(effectiveTrack, effectiveStartOffsetSec).catch(() => {
           setIsPlaying(false);
         });
       }
       return;
     }
 
-    // 2. Host in Online Party Mode
+    // 2. Host in Party Mode
     if (isOnlinePartyHost) {
       const hostMember = partyMembers.find((m) => m.isHost) ?? partyMembers[0];
       if (hostMember) {
@@ -1579,24 +1690,24 @@ export function App() {
       return;
     }
 
-    // 3. Solo Mode or Same-Room Local Party Mode
+    // 3. Solo Mode
     if (isCorrect) {
       const awarded = calculateNetRoundScore(usedDur, wrongGuessesCount);
       setRoundState('won');
       setIsPlaying(true);
-      const playbackProvider = getPlaybackProviderForTrack(currentTrack);
-      void playbackProvider.playFullTrack(currentTrack, startOffsetSec).catch(() => {
+      const playbackProvider = getPlaybackProviderForTrack(effectiveTrack);
+      void playbackProvider.playFullTrack(effectiveTrack, effectiveStartOffsetSec).catch(() => {
         setIsPlaying(false);
       });
-      setUsedTrackIds((prev) => new Set(prev).add(currentTrack.id));
+      setUsedTrackIds((prev) => new Set(prev).add(effectiveTrack.id));
       setRoundHistory((prev) => [
         ...prev,
         {
           roundNumber: prev.length + 1,
-          targetTrack: currentTrack,
+          targetTrack: effectiveTrack,
           status: 'won',
           unlockedDurationSec: usedDur,
-          startOffsetSec,
+          startOffsetSec: effectiveStartOffsetSec,
           wrongGuesses: wrongGuessesCount,
           guesses: updatedGuesses,
           pointsAwarded: awarded,
@@ -1627,7 +1738,7 @@ export function App() {
       return;
     }
 
-    if (!currentTrack || roundState !== 'playing') return;
+    if (!effectiveTrack || roundState !== 'playing') return;
 
     if (isOnlinePartyHost) {
       const hostMember = partyMembers.find((m) => m.isHost) ?? partyMembers[0];
@@ -1655,19 +1766,19 @@ export function App() {
 
     setRoundState('gave-up');
     setIsPlaying(true);
-    const playbackProvider = getPlaybackProviderForTrack(currentTrack);
-    void playbackProvider.playFullTrack(currentTrack, startOffsetSec).catch(() => {
+    const playbackProvider = getPlaybackProviderForTrack(effectiveTrack);
+    void playbackProvider.playFullTrack(effectiveTrack, effectiveStartOffsetSec).catch(() => {
       setIsPlaying(false);
     });
-    setUsedTrackIds((prev) => new Set(prev).add(currentTrack.id));
+    setUsedTrackIds((prev) => new Set(prev).add(effectiveTrack.id));
     setRoundHistory((prev) => [
       ...prev,
       {
         roundNumber: prev.length + 1,
-        targetTrack: currentTrack,
+        targetTrack: effectiveTrack,
         status: 'gave-up',
         unlockedDurationSec: usedDur,
-        startOffsetSec,
+        startOffsetSec: effectiveStartOffsetSec,
         wrongGuesses: wrongGuessesCount,
         guesses,
         pointsAwarded: 0,
@@ -1921,7 +2032,7 @@ export function App() {
                 <Home size={16} />
                 <div>
                   <strong>Same Room (Local)</strong>
-                  <span>Play together on this device</span>
+                  <span>Play together in one room (1 or more devices)</span>
                 </div>
               </button>
               <button
@@ -1932,108 +2043,253 @@ export function App() {
                 <Globe size={16} />
                 <div>
                   <strong>Online Room (Remote)</strong>
-                  <span>Join via Room Code on own devices</span>
+                  <span>Join from anywhere via Room Code</span>
                 </div>
               </button>
             </div>
 
-            {partyLocationMode === 'local' ? (
-              /* ==============================================================
-                 SAME ROOM (LOCAL) PARTY SETUP — Shared Device, No Room Code
-                 ============================================================== */
+            <div className="party-mode-tabs">
+              <button
+                type="button"
+                className={`party-tab-btn ${partyTab === 'host' ? 'active' : ''}`}
+                onClick={() => setPartyTab('host')}
+              >
+                <Crown size={15} />
+                <span>
+                  {partyLocationMode === 'local'
+                    ? `Host Same-Room Party (${partyMembers.length})`
+                    : `Host Online Room (${partyMembers.length})`}
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`party-tab-btn ${partyTab === 'join' ? 'active' : ''}`}
+                onClick={() => setPartyTab('join')}
+              >
+                <Send size={15} />
+                <span>Join Room Code</span>
+              </button>
+            </div>
+
+            {partyTab === 'host' ? (
               <div className="party-host-stack">
-                <div className="party-add-card">
-                  <span className="section-label">
-                    <UserPlus size={13} /> Add Players in This Room
-                  </span>
-                  <div className="party-form-row">
-                    <input
-                      type="text"
-                      className="party-text-input"
-                      placeholder={`Player Name (e.g. Player ${partyMembers.length + 1})`}
-                      value={newPlayerName}
-                      onChange={(e) => handlePlayerNameChange(e.target.value)}
-                    />
-                    <div className="provider-segmented">
+                <div className="room-code-banner">
+                  <div className="room-code-badge">
+                    <span className="code-label">
+                      {partyLocationMode === 'local'
+                        ? 'SAME-ROOM SYNC CODE (OPTIONAL FOR SECOND DEVICES)'
+                        : 'ONLINE ROOM CODE (SHARE WITH FRIENDS)'}
+                    </span>
+                    <div className="code-value-row">
+                      <span className="code-value">{hostRoomCode ?? '...'}</span>
                       <button
                         type="button"
-                        className={`seg-btn ${
-                          newPlayerProvider === 'youtube-music' ? 'active' : ''
-                        }`}
-                        onClick={() => setNewPlayerProvider('youtube-music')}
+                        className="btn-icon-mini"
+                        onClick={() => void handleManualRoomRefresh()}
+                        title="Check for joined players now"
+                        aria-label="Check for joined players"
                       >
-                        <Music2 size={13} />
-                        <span>YouTube</span>
-                      </button>
-                      <button
-                        type="button"
-                        className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
-                        onClick={() => setNewPlayerProvider('spotify')}
-                      >
-                        <Sparkles size={13} />
-                        <span>Spotify</span>
+                        <RefreshCw className={isPollingRoom ? 'spin' : ''} size={14} />
                       </button>
                     </div>
                   </div>
-
-                  <div className="party-btn-row">
-                    {selectedPartyProviderCachedCount > 0 && (
-                      <button
-                        type="button"
-                        className="btn-secondary"
-                        onClick={() => void handleAddHostOrLocalPlayer(false, true)}
-                      >
-                        <Check size={14} />
-                        <span>
-                          + Add Saved ({selectedPartyProviderCachedCount} songs)
-                        </span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="btn-primary"
-                      disabled={isLoadingLibrary}
-                      onClick={() => void handleAddHostOrLocalPlayer(false, false)}
-                    >
-                      <UserPlus size={15} />
-                      <span>
-                        {isLoadingLibrary
-                          ? 'Syncing...'
-                          : `Sign In & Add (${
-                              newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
-                            })`}
-                      </span>
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-share-invite"
+                    disabled={!hostRoomCode}
+                    onClick={() => void handleShareOrCopyInvite()}
+                  >
+                    {copiedLink ? <Check size={15} /> : <Share2 size={15} />}
+                    <span>{copiedLink ? 'Link Copied!' : 'Share Invite Link'}</span>
+                  </button>
                 </div>
 
+                {/* Host / Local Player Add Card */}
+                {partyLocationMode === 'local' ? (
+                  <div className="party-add-card">
+                    <span className="section-label">
+                      <UserPlus size={13} /> Add Players in This Room
+                    </span>
+                    <div className="party-form-row">
+                      <input
+                        type="text"
+                        className="party-text-input"
+                        placeholder={`Player Name (e.g. ${
+                          partyMembers.length === 0 ? hostName || 'Player 1' : `Player ${partyMembers.length + 1}`
+                        })`}
+                        value={newPlayerName}
+                        onChange={(e) => handlePlayerNameChange(e.target.value)}
+                      />
+                      <div className="provider-segmented">
+                        <button
+                          type="button"
+                          className={`seg-btn ${
+                            newPlayerProvider === 'youtube-music' ? 'active' : ''
+                          }`}
+                          onClick={() => setNewPlayerProvider('youtube-music')}
+                        >
+                          <Music2 size={13} />
+                          <span>YouTube</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
+                          onClick={() => setNewPlayerProvider('spotify')}
+                        >
+                          <Sparkles size={13} />
+                          <span>Spotify</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="party-btn-row">
+                      {selectedPartyProviderCachedCount > 0 && (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() =>
+                            void handleAddHostOrLocalPlayer(partyMembers.length === 0, true)
+                          }
+                        >
+                          <Check size={14} />
+                          <span>
+                            + Add Saved ({selectedPartyProviderCachedCount} songs)
+                          </span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        disabled={isLoadingLibrary}
+                        onClick={() =>
+                          void handleAddHostOrLocalPlayer(partyMembers.length === 0, false)
+                        }
+                      >
+                        <UserPlus size={15} />
+                        <span>
+                          {isLoadingLibrary
+                            ? 'Syncing...'
+                            : `Sign In & Add (${
+                                newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
+                              })`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="party-add-card">
+                    <span className="section-label">
+                      <Crown size={12} /> Your Host Name & Music Library
+                    </span>
+                    <div className="party-form-row">
+                      <input
+                        type="text"
+                        className="party-text-input"
+                        placeholder="Your Host Name (e.g. Thomas)"
+                        value={hostName}
+                        onChange={(e) => handleHostNameChange(e.target.value)}
+                      />
+                      <div className="provider-segmented">
+                        <button
+                          type="button"
+                          className={`seg-btn ${
+                            newPlayerProvider === 'youtube-music' ? 'active' : ''
+                          }`}
+                          onClick={() => setNewPlayerProvider('youtube-music')}
+                        >
+                          <Music2 size={13} />
+                          <span>YouTube</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
+                          onClick={() => setNewPlayerProvider('spotify')}
+                        >
+                          <Sparkles size={13} />
+                          <span>Spotify</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="party-btn-row">
+                      {selectedPartyProviderCachedCount > 0 && (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => void handleAddHostOrLocalPlayer(true, true)}
+                        >
+                          <Check size={14} />
+                          <span>
+                            Use Saved as {hostName.trim() || 'Host'} (
+                            {selectedPartyProviderCachedCount})
+                          </span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        disabled={isLoadingLibrary}
+                        onClick={() => void handleAddHostOrLocalPlayer(true, false)}
+                      >
+                        <UserPlus size={15} />
+                        <span>
+                          {isLoadingLibrary
+                            ? 'Syncing...'
+                            : `Connect ${
+                                newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
+                              } as ${hostName.trim() || 'Host'}`}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Unified Party Roster, Ready Sync Gate & Start Button */}
                 <div className="party-roster-card">
                   <div className="roster-header">
                     <span className="section-label">
-                      Local Party Roster ({partyMembers.length} Players)
+                      {partyLocationMode === 'local'
+                        ? `Same-Room Party Roster (${partyMembers.length} Players)`
+                        : `Online Room Roster (${partyMembers.length} Joined)`}
                     </span>
-                    {partyMembers.length > 0 && (
-                      <button
-                        type="button"
-                        className="btn-chip danger"
-                        onClick={handleClearParty}
-                      >
-                        <Trash2 size={13} />
-                        <span>Clear</span>
-                      </button>
-                    )}
+                    <div className="party-btn-row">
+                      {partyMembers.length > 0 && !allPartyMembersReady && (
+                        <button
+                          type="button"
+                          className="btn-chip"
+                          onClick={handleHostReadyAllLocal}
+                          title="Mark local players on this device as Ready"
+                        >
+                          <UserCheck size={13} />
+                          <span>Ready Local ✓</span>
+                        </button>
+                      )}
+                      {partyMembers.length > 0 && (
+                        <button
+                          type="button"
+                          className="btn-chip danger"
+                          onClick={handleClearParty}
+                        >
+                          <Trash2 size={13} />
+                          <span>Reset</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {partyMembers.length === 0 ? (
                     <p className="party-empty-hint">
-                      Add 2 or more friends on this device with YouTube Music or Spotify. Exact
-                      shared songs play first, followed by fair rotation!
+                      {partyLocationMode === 'local'
+                        ? 'Add players on this device (or have friends in the room join with the Room Code above). Mark everyone Ready to start!'
+                        : 'Set your Host Name above and connect your library, then share the Room Code so remote players can join and mark Ready!'}
                     </p>
                   ) : (
                     <>
                       <div className="party-stats-pills">
                         <div className="party-stat-box highlight">
-                          <span className="p-stat-num">{mergedPartyPool.sharedMatchesCount}</span>
+                          <span className="p-stat-num">
+                            {mergedPartyPool.sharedMatchesCount}
+                          </span>
                           <span className="p-stat-label">Shared Matches</span>
                         </div>
                         <div className="party-stat-box">
@@ -2050,12 +2306,22 @@ export function App() {
                               style={{ backgroundColor: member.color }}
                             />
                             <div className="member-info">
-                              <strong>{member.name}</strong>
+                              <strong>
+                                {member.name} {member.isHost ? '(Host)' : ''}
+                              </strong>
                               <span>
                                 {member.provider === 'youtube-music' ? 'YouTube' : 'Spotify'} ·{' '}
                                 {member.tracks.length} songs
                               </span>
                             </div>
+                            <button
+                              type="button"
+                              className={`ready-pill ${member.isReady ? 'ready' : 'waiting'}`}
+                              onClick={() => handleHostToggleMemberReady(member.id)}
+                              title="Click to toggle Ready status"
+                            >
+                              {member.isReady ? 'Ready ✓' : 'Tap to Ready'}
+                            </button>
                             <button
                               type="button"
                               className="member-remove"
@@ -2071,15 +2337,20 @@ export function App() {
                       <button
                         type="button"
                         className="btn-primary btn-full-width"
-                        onClick={() => {
-                          cancelCurrentGame();
-                          setIsPartyLobbyOpen(false);
-                          void startNewRound(mergedPartyPool.tracks, true);
-                        }}
+                        disabled={!allPartyMembersReady || isPreparingRound}
+                        onClick={() => void handleStartPartyQuiz()}
                       >
                         <Play size={16} />
                         <span>
-                          Start Local Party Quiz ({mergedPartyPool.totalUniqueCount} Songs)
+                          {isPreparingRound
+                            ? 'Syncing First Song for All Players...'
+                            : !allPartyMembersReady
+                            ? `Sync Up: Waiting for ${unreadyPartyMembersCount} player${
+                                unreadyPartyMembersCount > 1 ? 's' : ''
+                              } to Ready Up...`
+                            : `Start ${
+                                partyLocationMode === 'local' ? 'Same-Room' : 'Online'
+                              } Party Quiz (${mergedPartyPool.totalUniqueCount} Songs)`}
                         </span>
                       </button>
                     </>
@@ -2087,359 +2358,140 @@ export function App() {
                 </div>
               </div>
             ) : (
-              /* ==============================================================
-                 ONLINE ROOM (REMOTE) PARTY SETUP — Multi-Device via Room Code
-                 ============================================================== */
-              <>
-                <div className="party-mode-tabs">
+              /* Guest Join & Ready Lobby Tab (Works for Both Same-Room Second Devices & Remote Players) */
+              <div className="party-join-panel">
+                <p className="join-lead">
+                  Enter the host&apos;s 5-character Room Code, sync your library, and tap{' '}
+                  <strong>I&apos;m Ready</strong> so everyone starts on the exact same song!
+                </p>
+
+                <div className="join-fields-stack">
+                  <div className="join-inputs-row">
+                    <input
+                      type="text"
+                      maxLength={6}
+                      className="party-text-input code-input"
+                      placeholder="CODE"
+                      value={joinRoomCode}
+                      onChange={(e) => handleJoinCodeChange(e.target.value)}
+                    />
+                    <input
+                      type="text"
+                      className="party-text-input"
+                      placeholder="Your Name"
+                      value={newPlayerName}
+                      onChange={(e) => handlePlayerNameChange(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="provider-segmented full-width">
+                    <button
+                      type="button"
+                      className={`seg-btn ${
+                        newPlayerProvider === 'youtube-music' ? 'active' : ''
+                      }`}
+                      onClick={() => setNewPlayerProvider('youtube-music')}
+                    >
+                      <Music2 size={14} />
+                      <span>YouTube Music</span>
+                    </button>
+                    <button
+                      type="button"
+                      className={`seg-btn ${
+                        newPlayerProvider === 'spotify' ? 'active' : ''
+                      }`}
+                      onClick={() => setNewPlayerProvider('spotify')}
+                    >
+                      <Sparkles size={14} />
+                      <span>Spotify</span>
+                    </button>
+                  </div>
+                </div>
+
+                <div className="party-btn-row">
+                  {selectedPartyProviderCachedCount > 0 && (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      disabled={isLoadingLibrary}
+                      onClick={() => void handleGuestJoinAndSend(true)}
+                    >
+                      <Send size={15} />
+                      <span>Send Saved ({selectedPartyProviderCachedCount} songs)</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
-                    className={`party-tab-btn ${partyTab === 'host' ? 'active' : ''}`}
-                    onClick={() => setPartyTab('host')}
-                  >
-                    <Crown size={15} />
-                    <span>Host Online Room ({partyMembers.length})</span>
-                  </button>
-                  <button
-                    type="button"
-                    className={`party-tab-btn ${partyTab === 'join' ? 'active' : ''}`}
-                    onClick={() => setPartyTab('join')}
+                    className="btn-primary"
+                    disabled={isLoadingLibrary}
+                    onClick={() => void handleGuestJoinAndSend(false)}
                   >
                     <Send size={15} />
-                    <span>Join with Room Code</span>
+                    <span>
+                      {isLoadingLibrary
+                        ? 'Connecting & Sending...'
+                        : `Sign In & Join (${
+                            newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
+                          })`}
+                    </span>
                   </button>
                 </div>
 
-                {partyTab === 'host' ? (
-                  <div className="party-host-stack">
-                    <div className="room-code-banner">
-                      <div className="room-code-badge">
-                        <span className="code-label">ONLINE ROOM CODE (SHARE WITH FRIENDS)</span>
-                        <div className="code-value-row">
-                          <span className="code-value">{hostRoomCode ?? '...'}</span>
-                          <button
-                            type="button"
-                            className="btn-icon-mini"
-                            onClick={() => void handleManualRoomRefresh()}
-                            title="Check for joined players now"
-                            aria-label="Check for joined players"
-                          >
-                            <RefreshCw className={isPollingRoom ? 'spin' : ''} size={14} />
-                          </button>
-                        </div>
-                      </div>
-                      <button
-                        type="button"
-                        className="btn-secondary btn-share-invite"
-                        disabled={!hostRoomCode}
-                        onClick={() => void handleShareOrCopyInvite()}
-                      >
-                        {copiedLink ? <Check size={15} /> : <Share2 size={15} />}
-                        <span>{copiedLink ? 'Link Copied!' : 'Share Invite Link'}</span>
-                      </button>
-                    </div>
-
-                    {/* Host Name & Host Library Setup */}
-                    <div className="party-add-card">
-                      <span className="section-label">
-                        <Crown size={12} /> Your Host Name & Music Library
+                {(guestAck || guestRoomState) && (
+                  <div className="guest-ready-card">
+                    <div className="guest-ack-banner">
+                      <CheckCircle2 size={18} />
+                      <span>
+                        Connected to Room{' '}
+                        <strong>{guestRoomState?.roomCode ?? guestAck?.roomCode}</strong>
+                        {guestRoomState ? (
+                          <>
+                            {' '}
+                            (Host: <strong>{guestRoomState.hostName}</strong> ·{' '}
+                            <strong>{guestRoomState.totalTracksCount} songs</strong>)
+                          </>
+                        ) : null}
                       </span>
-                      <div className="party-form-row">
-                        <input
-                          type="text"
-                          className="party-text-input"
-                          placeholder="Your Host Name (e.g. Thomas)"
-                          value={hostName}
-                          onChange={(e) => handleHostNameChange(e.target.value)}
-                        />
-                        <div className="provider-segmented">
-                          <button
-                            type="button"
-                            className={`seg-btn ${
-                              newPlayerProvider === 'youtube-music' ? 'active' : ''
-                            }`}
-                            onClick={() => setNewPlayerProvider('youtube-music')}
-                          >
-                            <Music2 size={13} />
-                            <span>YouTube</span>
-                          </button>
-                          <button
-                            type="button"
-                            className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
-                            onClick={() => setNewPlayerProvider('spotify')}
-                          >
-                            <Sparkles size={13} />
-                            <span>Spotify</span>
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="party-btn-row">
-                        {selectedPartyProviderCachedCount > 0 && (
-                          <button
-                            type="button"
-                            className="btn-secondary"
-                            onClick={() => void handleAddHostOrLocalPlayer(true, true)}
-                          >
-                            <Check size={14} />
-                            <span>
-                              Use Saved as {hostName.trim() || 'Host'} (
-                              {selectedPartyProviderCachedCount})
-                            </span>
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          className="btn-primary"
-                          disabled={isLoadingLibrary}
-                          onClick={() => void handleAddHostOrLocalPlayer(true, false)}
-                        >
-                          <UserPlus size={15} />
-                          <span>
-                            {isLoadingLibrary
-                              ? 'Syncing...'
-                              : `Connect ${
-                                  newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
-                                } as ${hostName.trim() || 'Host'}`}
-                          </span>
-                        </button>
-                      </div>
                     </div>
 
-                    {/* Online Roster, Ready Gate & Start Button */}
-                    <div className="party-roster-card">
-                      <div className="roster-header">
-                        <span className="section-label">
-                          Online Room Roster ({partyMembers.length} Joined)
-                        </span>
-                        {partyMembers.length > 0 && (
-                          <button
-                            type="button"
-                            className="btn-chip danger"
-                            onClick={handleClearParty}
-                          >
-                            <Trash2 size={13} />
-                            <span>Reset Room</span>
-                          </button>
-                        )}
-                      </div>
+                    <button
+                      type="button"
+                      className={`btn-ready-toggle ${guestIsReady ? 'is-ready' : ''}`}
+                      onClick={handleToggleGuestReady}
+                    >
+                      <UserCheck size={18} />
+                      <span>
+                        {guestIsReady
+                          ? 'Ready ✓ — Waiting for Host to Start Quiz (Tap to Unready)'
+                          : "I'm Ready! (Tap so Host Can Start Quiz)"}
+                      </span>
+                    </button>
 
-                      {partyMembers.length === 0 ? (
-                        <p className="party-empty-hint">
-                          Set your Host Name above and connect your library, then share the Room
-                          Code so remote players can join and mark Ready!
-                        </p>
-                      ) : (
-                        <>
-                          <div className="party-stats-pills">
-                            <div className="party-stat-box highlight">
-                              <span className="p-stat-num">
-                                {mergedPartyPool.sharedMatchesCount}
-                              </span>
-                              <span className="p-stat-label">Shared Matches</span>
+                    {guestRoomState && guestRoomState.leaderboard.length > 0 && (
+                      <div className="member-list">
+                        {guestRoomState.leaderboard.map((m) => (
+                          <div key={m.memberId} className="member-row">
+                            <span
+                              className="member-dot"
+                              style={{ backgroundColor: m.color }}
+                            />
+                            <div className="member-info">
+                              <strong>
+                                {m.name} {m.isHost ? '(Host)' : ''}
+                              </strong>
+                              <span>{m.trackCount} songs</span>
                             </div>
-                            <div className="party-stat-box">
-                              <span className="p-stat-num">{mergedPartyPool.totalUniqueCount}</span>
-                              <span className="p-stat-label">Total Unique Songs</span>
-                            </div>
-                          </div>
-
-                          <div className="member-list">
-                            {partyMembers.map((member) => (
-                              <div key={member.id} className="member-row">
-                                <span
-                                  className="member-dot"
-                                  style={{ backgroundColor: member.color }}
-                                />
-                                <div className="member-info">
-                                  <strong>
-                                    {member.name} {member.isHost ? '(Host)' : ''}
-                                  </strong>
-                                  <span>
-                                    {member.provider === 'youtube-music' ? 'YouTube' : 'Spotify'} ·{' '}
-                                    {member.tracks.length} songs
-                                  </span>
-                                </div>
-                                <button
-                                  type="button"
-                                  className={`ready-pill ${member.isReady ? 'ready' : 'waiting'}`}
-                                  onClick={() => handleHostToggleMemberReady(member.id)}
-                                  title="Click to toggle Ready status"
-                                >
-                                  {member.isReady ? 'Ready ✓' : 'Waiting...'}
-                                </button>
-                                <button
-                                  type="button"
-                                  className="member-remove"
-                                  onClick={() => handleRemovePartyMember(member.id)}
-                                  aria-label={`Remove ${member.name}`}
-                                >
-                                  <X size={15} />
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-
-                          <button
-                            type="button"
-                            className="btn-primary btn-full-width"
-                            disabled={!allPartyMembersReady}
-                            onClick={() => {
-                              cancelCurrentGame();
-                              setIsPartyLobbyOpen(false);
-                              void startNewRound(mergedPartyPool.tracks, true);
-                            }}
-                          >
-                            <Play size={16} />
-                            <span>
-                              {!allPartyMembersReady
-                                ? `Waiting for ${unreadyPartyMembersCount} player${
-                                    unreadyPartyMembersCount > 1 ? 's' : ''
-                                  } to Ready Up...`
-                                : `Start Online Party Quiz (${mergedPartyPool.totalUniqueCount} Songs)`}
+                            <span className={`ready-pill ${m.isReady ? 'ready' : 'waiting'}`}>
+                              {m.isReady ? 'Ready ✓' : 'Waiting...'}
                             </span>
-                          </button>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  /* Remote Guest Join & Ready Lobby Tab */
-                  <div className="party-join-panel">
-                    <p className="join-lead">
-                      Enter the host&apos;s 5-character Room Code, sync your library, and tap{' '}
-                      <strong>I&apos;m Ready</strong> so the host can start the quiz!
-                    </p>
-
-                    <div className="join-fields-stack">
-                      <div className="join-inputs-row">
-                        <input
-                          type="text"
-                          maxLength={6}
-                          className="party-text-input code-input"
-                          placeholder="CODE"
-                          value={joinRoomCode}
-                          onChange={(e) => handleJoinCodeChange(e.target.value)}
-                        />
-                        <input
-                          type="text"
-                          className="party-text-input"
-                          placeholder="Your Name"
-                          value={newPlayerName}
-                          onChange={(e) => handlePlayerNameChange(e.target.value)}
-                        />
-                      </div>
-
-                      <div className="provider-segmented full-width">
-                        <button
-                          type="button"
-                          className={`seg-btn ${
-                            newPlayerProvider === 'youtube-music' ? 'active' : ''
-                          }`}
-                          onClick={() => setNewPlayerProvider('youtube-music')}
-                        >
-                          <Music2 size={14} />
-                          <span>YouTube Music</span>
-                        </button>
-                        <button
-                          type="button"
-                          className={`seg-btn ${
-                            newPlayerProvider === 'spotify' ? 'active' : ''
-                          }`}
-                          onClick={() => setNewPlayerProvider('spotify')}
-                        >
-                          <Sparkles size={14} />
-                          <span>Spotify</span>
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="party-btn-row">
-                      {selectedPartyProviderCachedCount > 0 && (
-                        <button
-                          type="button"
-                          className="btn-secondary"
-                          disabled={isLoadingLibrary}
-                          onClick={() => void handleGuestJoinAndSend(true)}
-                        >
-                          <Send size={15} />
-                          <span>Send Saved ({selectedPartyProviderCachedCount} songs)</span>
-                        </button>
-                      )}
-
-                      <button
-                        type="button"
-                        className="btn-primary"
-                        disabled={isLoadingLibrary}
-                        onClick={() => void handleGuestJoinAndSend(false)}
-                      >
-                        <Send size={15} />
-                        <span>
-                          {isLoadingLibrary
-                            ? 'Connecting & Sending...'
-                            : `Sign In & Join (${
-                                newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
-                              })`}
-                        </span>
-                      </button>
-                    </div>
-
-                    {(guestAck || guestRoomState) && (
-                      <div className="guest-ready-card">
-                        <div className="guest-ack-banner">
-                          <CheckCircle2 size={18} />
-                          <span>
-                            Connected to Room{' '}
-                            <strong>{guestRoomState?.roomCode ?? guestAck?.roomCode}</strong>
-                            {guestRoomState ? (
-                              <>
-                                {' '}
-                                (Host: <strong>{guestRoomState.hostName}</strong> ·{' '}
-                                <strong>{guestRoomState.totalTracksCount} songs</strong>)
-                              </>
-                            ) : null}
-                          </span>
-                        </div>
-
-                        <button
-                          type="button"
-                          className={`btn-ready-toggle ${guestIsReady ? 'is-ready' : ''}`}
-                          onClick={handleToggleGuestReady}
-                        >
-                          <UserCheck size={18} />
-                          <span>
-                            {guestIsReady
-                              ? 'Ready ✓ — Waiting for Host to Start Quiz (Tap to Unready)'
-                              : "I'm Ready! (Tap so Host Can Start Quiz)"}
-                          </span>
-                        </button>
-
-                        {guestRoomState && guestRoomState.leaderboard.length > 0 && (
-                          <div className="member-list">
-                            {guestRoomState.leaderboard.map((m) => (
-                              <div key={m.memberId} className="member-row">
-                                <span
-                                  className="member-dot"
-                                  style={{ backgroundColor: m.color }}
-                                />
-                                <div className="member-info">
-                                  <strong>
-                                    {m.name} {m.isHost ? '(Host)' : ''}
-                                  </strong>
-                                  <span>{m.trackCount} songs</span>
-                                </div>
-                                <span className={`ready-pill ${m.isReady ? 'ready' : 'waiting'}`}>
-                                  {m.isReady ? 'Ready ✓' : 'Waiting...'}
-                                </span>
-                              </div>
-                            ))}
                           </div>
-                        )}
+                        ))}
                       </div>
                     )}
                   </div>
                 )}
-              </>
+              </div>
             )}
           </section>
         ) : !isRemoteGuestPlaying && catalog.length === 0 ? (
@@ -2657,6 +2709,7 @@ export function App() {
                         setGuestAck(null);
                       } else {
                         cancelCurrentGame();
+                        resetAllPartyMembersToUnready();
                         setIsPartyLobbyOpen(true);
                       }
                     }}
@@ -2701,7 +2754,7 @@ export function App() {
                       type="button"
                       className={`hero-play-btn ${isPlaying ? 'playing' : ''}`}
                       onClick={() => void handlePlayToggle()}
-                      disabled={!currentTrack}
+                      disabled={!effectiveTrack || isPreparingRound}
                       aria-label={isPlaying ? 'Stop playback' : 'Play snippet'}
                     >
                       {isPlaying ? (
@@ -2714,7 +2767,9 @@ export function App() {
                     <div className="scrubber-column">
                       <div className="timeline-status-row">
                         <span className="status-text">
-                          {isPlaying ? (
+                          {isPreparingRound ? (
+                            <>Syncing song across players...</>
+                          ) : isPlaying ? (
                             <>
                               <Volume2 size={14} className="pulse-icon" />{' '}
                               {playbackElapsedSec.toFixed(1)}s / {snippetDurationSec.toFixed(1)}s
@@ -2905,7 +2960,7 @@ export function App() {
               </>
             ) : (
               /* FOCUSED ROUND RESULT SPOTLIGHT */
-              currentTrack && (
+              effectiveTrack && (
                 <div className={`result-spotlight ${roundState}`}>
                   <div className="spotlight-badge-row">
                     {roundState === 'won' ? (
@@ -2933,10 +2988,10 @@ export function App() {
 
                   <div className="spotlight-stage">
                     <div className={`spotlight-cover-wrap ${isPlaying ? 'playing' : ''}`}>
-                      {currentTrack.artworkUrl ? (
+                      {effectiveTrack.artworkUrl ? (
                         <img
-                          src={currentTrack.artworkUrl}
-                          alt={currentTrack.title}
+                          src={effectiveTrack.artworkUrl}
+                          alt={effectiveTrack.title}
                           className="spotlight-cover"
                         />
                       ) : (
@@ -2967,20 +3022,20 @@ export function App() {
                         </span>
                         <span>{isPlaying ? 'Now Playing' : 'Paused'}</span>
                       </div>
-                      <h2 className="spotlight-title">{currentTrack.title}</h2>
-                      <p className="spotlight-artist">{currentTrack.artist}</p>
+                      <h2 className="spotlight-title">{effectiveTrack.title}</h2>
+                      <p className="spotlight-artist">{effectiveTrack.artist}</p>
 
                       {/* Favorited By Attribution */}
                       <div className="favorited-by-block">
                         <span className="favorited-by-label">
                           <Heart size={12} className="heart-icon" />
-                          {(currentTrack.favoritedBy?.length ?? 0) >= 2
+                          {(effectiveTrack.favoritedBy?.length ?? 0) >= 2
                             ? 'Shared Match! Favorited by:'
                             : 'Favorited by:'}
                         </span>
                         <div className="favorited-by-pills">
-                          {currentTrack.favoritedBy && currentTrack.favoritedBy.length > 0 ? (
-                            currentTrack.favoritedBy.map((fav) => (
+                          {effectiveTrack.favoritedBy && effectiveTrack.favoritedBy.length > 0 ? (
+                            effectiveTrack.favoritedBy.map((fav) => (
                               <span
                                 key={fav.memberId}
                                 className="favorited-user-pill"
@@ -3024,10 +3079,11 @@ export function App() {
                       <button
                         type="button"
                         autoFocus
+                        disabled={isPreparingRound}
                         className="btn-primary btn-next-song-lg"
                         onClick={() => void startNewRound()}
                       >
-                        <span>Next Song</span>
+                        <span>{isPreparingRound ? 'Syncing Next Song...' : 'Next Song'}</span>
                         <ArrowRight size={17} />
                       </button>
                     </div>
