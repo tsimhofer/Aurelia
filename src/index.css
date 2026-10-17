@@ -1956,6 +1956,56 @@ body {
   gap: 0.35rem;
 }
 
+.party-location-switcher {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.55rem;
+}
+
+.party-loc-btn {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  background: var(--bg-subtle);
+  border: 1.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 0.7rem 0.85rem;
+  color: var(--text-muted);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.party-loc-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text-main);
+}
+
+.party-loc-btn.active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--text-main);
+  box-shadow: 2px 2px 0px rgba(0, 0, 0, 0.45);
+}
+
+.party-loc-btn div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.party-loc-btn strong {
+  font-family: var(--font-display);
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+.party-loc-btn span {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
 @media (max-width: 560px) {
   .app-shell {
     padding: 0.65rem 0.65rem 2.5rem;
@@ -1964,6 +2014,10 @@ body {
   .surface-card {
     padding: 1rem;
     box-shadow: 3px 3px 0px var(--shadow-tint);
+  }
+
+  .party-location-switcher {
+    grid-template-columns: 1fr;
   }
 
   .milestone-bar {
@@ -2013,3 +2067,4 @@ body {
     width: 100%;
   }
 }
+

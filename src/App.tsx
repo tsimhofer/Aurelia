@@ -4,12 +4,13 @@ import {
   ArrowRight,
   Check,
   CheckCircle2,
-  Clock,
   Crown,
   Disc3,
   Ear,
   Flag,
+  Globe,
   Heart,
+  Home,
   LogOut,
   Music2,
   Play,
@@ -69,17 +70,19 @@ import { YouTubeMusicProvider } from './providers/YouTubeMusicProvider';
 type ScreenView = 'quiz' | 'summary';
 type OffsetMode = 'zero' | 'random';
 type GameMode = 'youtube-music' | 'spotify' | 'party';
+type PartyLocationMode = 'local' | 'remote';
 
 const MILESTONE_SECONDS = [0.1, 0.5, 1, 2, 5, 10, 15, 30];
 const STORAGE_KEY_PARTY_MEMBERS = 'aurelia.party.members.v2';
-const STORAGE_KEY_PENDING_PARTY_ACTION = 'aurelia.party.pending_action.v3';
-const STORAGE_KEY_GAME_SESSION = 'aurelia.game.session.v3';
+const STORAGE_KEY_PENDING_PARTY_ACTION = 'aurelia.party.pending_action.v4';
+const STORAGE_KEY_GAME_SESSION = 'aurelia.game.session.v4';
 const STORAGE_KEY_SAVED_JOIN_CODE = 'aurelia.party.join_code.v1';
 const STORAGE_KEY_SAVED_PLAYER_NAME = 'aurelia.party.player_name.v1';
 const STORAGE_KEY_SAVED_HOST_NAME = 'aurelia.party.host_name.v1';
 const STORAGE_KEY_GUEST_MEMBER_ID = 'aurelia.party.guest_id.v1';
 
 interface PendingPartyAction {
+  locationMode: PartyLocationMode;
   mode: 'host-add' | 'local-add' | 'remote-join';
   playerName: string;
   provider: ProviderId;
@@ -89,11 +92,11 @@ interface PendingPartyAction {
 
 interface PersistedGameSession {
   gameMode: GameMode;
+  partyLocationMode: PartyLocationMode;
   isPartyLobbyOpen: boolean;
   view: ScreenView;
   offsetMode: OffsetMode;
   currentTrack: Track | null;
-  roundStartedAtMs: number;
   startOffsetSec: number;
   snippetDurationSec: number;
   maxUnlockedDurationSec: number;
@@ -198,6 +201,25 @@ export function App() {
     return 'youtube-music';
   });
 
+  // Party Mode Differentiation: 'local' (Same Room / 1 Device) vs 'remote' (Online Multi-Device)
+  const [partyLocationMode, setPartyLocationMode] = useState<PartyLocationMode>(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('party')) return 'remote';
+      const pendingRaw = localStorage.getItem(STORAGE_KEY_PENDING_PARTY_ACTION);
+      if (pendingRaw) {
+        const pending = JSON.parse(pendingRaw) as PendingPartyAction;
+        if (pending.locationMode) return pending.locationMode;
+      }
+      if (savedSession?.partyLocationMode) {
+        return savedSession.partyLocationMode;
+      }
+    } catch {
+      // Ignore
+    }
+    return 'local';
+  });
+
   const activeProviderId: ProviderId = gameMode === 'spotify' ? 'spotify' : 'youtube-music';
   const activeProvider: MusicProvider =
     activeProviderId === 'youtube-music' ? ytProviderRef.current : spotifyProviderRef.current;
@@ -244,7 +266,7 @@ export function App() {
     partyScoresRef.current = partyScores;
   }, [partyScores]);
 
-  // Per-round player guess states on the Host
+  // Per-round player guess states in Online Party Mode
   const [roundPlayerStates, setRoundPlayerStates] = useState<
     Record<
       string,
@@ -253,7 +275,6 @@ export function App() {
         roundPoints: number;
         wrongAttempts: number;
         guessTimestampMs?: number;
-        guessElapsedSec?: number;
         guessSnippetSec?: number;
         lastGuessTitle?: string;
       }
@@ -300,7 +321,7 @@ export function App() {
   const [isPollingRoom, setIsPollingRoom] = useState<boolean>(false);
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
 
-  // Remote Guest Controller State
+  // Remote Guest State
   const [joinRoomCode, setJoinRoomCode] = useState<string>(() => {
     try {
       const params = new URLSearchParams(window.location.search);
@@ -318,8 +339,7 @@ export function App() {
   const [guestIsReady, setGuestIsReady] = useState<boolean>(false);
   const [guestRoomState, setGuestRoomState] = useState<PartyRoomStatePayload | null>(null);
   const [guestCatalog, setGuestCatalog] = useState<PartyCatalogItem[]>([]);
-  const [guestGuesses, setGuestGuesses] = useState<RoundGuess[]>([]);
-  const [guestActiveRoundNum, setGuestActiveRoundNum] = useState<number>(0);
+  const [guestSyncedRoundNum, setGuestSyncedRoundNum] = useState<number>(0);
 
   const handleHostNameChange = (val: string) => {
     setHostName(val);
@@ -367,9 +387,19 @@ export function App() {
   );
 
   const isPartyMode = gameMode === 'party';
+  const isOnlinePartyHost = isPartyMode && partyLocationMode === 'remote' && partyTab === 'host';
+  const isRemoteGuestPlaying =
+    isPartyMode &&
+    partyLocationMode === 'remote' &&
+    partyTab === 'join' &&
+    Boolean(
+      guestRoomState &&
+        (guestRoomState.status === 'playing' || guestRoomState.status === 'revealed')
+    );
+
   const catalog = isPartyMode ? mergedPartyPool.tracks : soloCatalog;
 
-  // Game & Round State
+  // Game & Round State (Each player controls their own music player & snippet duration!)
   const [view, setView] = useState<ScreenView>(() => savedSession?.view ?? 'quiz');
   const [offsetMode, setOffsetMode] = useState<OffsetMode>(
     () => savedSession?.offsetMode ?? 'zero'
@@ -381,14 +411,6 @@ export function App() {
   useEffect(() => {
     currentTrackRef.current = currentTrack;
   }, [currentTrack]);
-
-  const [roundStartedAtMs, setRoundStartedAtMs] = useState<number>(
-    () => savedSession?.roundStartedAtMs ?? Date.now()
-  );
-  const roundStartedAtMsRef = useRef<number>(roundStartedAtMs);
-  useEffect(() => {
-    roundStartedAtMsRef.current = roundStartedAtMs;
-  }, [roundStartedAtMs]);
 
   const [startOffsetSec, setStartOffsetSec] = useState<number>(
     () => savedSession?.startOffsetSec ?? 0
@@ -406,7 +428,6 @@ export function App() {
 
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackElapsedSec, setPlaybackElapsedSec] = useState<number>(0);
-  const [liveRoundTimerSec, setLiveRoundTimerSec] = useState<number>(0);
 
   const [guesses, setGuesses] = useState<RoundGuess[]>(() => savedSession?.guesses ?? []);
   const [roundState, setRoundState] = useState<'playing' | 'won' | 'gave-up'>(
@@ -424,40 +445,16 @@ export function App() {
     () => new Set(savedSession?.usedTrackIds ?? [])
   );
 
-  // Live ticking round elapsed timer (for timestamp scoring display)
-  useEffect(() => {
-    const activeStartMs =
-      isPartyMode && partyTab === 'join' && guestRoomState
-        ? guestRoomState.roundStartedAtMs
-        : roundStartedAtMs;
-
-    const tick = () => {
-      const diff = Math.max(0, (Date.now() - activeStartMs) / 1000);
-      setLiveRoundTimerSec(Number(diff.toFixed(1)));
-    };
-    tick();
-    const id = window.setInterval(tick, 100);
-    return () => window.clearInterval(id);
-  }, [roundStartedAtMs, isPartyMode, partyTab, guestRoomState]);
-
-  // Reset guest's local round guesses when the host advances to a new round
-  useEffect(() => {
-    if (guestRoomState && guestRoomState.roundNumber !== guestActiveRoundNum) {
-      setGuestActiveRoundNum(guestRoomState.roundNumber);
-      setGuestGuesses([]);
-    }
-  }, [guestRoomState, guestActiveRoundNum]);
-
   // Persist active game session
   useEffect(() => {
     try {
       const payload: PersistedGameSession = {
         gameMode,
+        partyLocationMode,
         isPartyLobbyOpen,
         view,
         offsetMode,
         currentTrack,
-        roundStartedAtMs,
         startOffsetSec,
         snippetDurationSec,
         maxUnlockedDurationSec,
@@ -474,11 +471,11 @@ export function App() {
     }
   }, [
     gameMode,
+    partyLocationMode,
     isPartyLobbyOpen,
     view,
     offsetMode,
     currentTrack,
-    roundStartedAtMs,
     startOffsetSec,
     snippetDurationSec,
     maxUnlockedDurationSec,
@@ -516,7 +513,46 @@ export function App() {
     setIsPlaying(false);
   }, []);
 
-  // Build the live PartyLeaderboardEntry[] sorted by score and guess timestamp
+  // When a Remote Guest receives a new round or revealed state from the Host,
+  // cue the track on the Guest's own music player so the Guest controls their own snippet playback!
+  useEffect(() => {
+    if (!isRemoteGuestPlaying || !guestRoomState?.currentTrack) return;
+
+    const incomingTrack = guestRoomState.currentTrack;
+    if (guestRoomState.roundNumber !== guestSyncedRoundNum) {
+      stopAllPlayback();
+      setGuestSyncedRoundNum(guestRoomState.roundNumber);
+      setCurrentTrack(incomingTrack);
+      setStartOffsetSec(guestRoomState.startOffsetSec ?? 0);
+      setSnippetDurationSec(MIN_SNIPPET_SECONDS);
+      setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
+      setGuesses([]);
+      setRoundState('playing');
+      setSearchQuery('');
+      setIsDropdownOpen(false);
+
+      const provider = getPlaybackProviderForTrack(incomingTrack);
+      void provider.cueTrack(incomingTrack).catch(() => {});
+    } else if (guestRoomState.status === 'revealed' && roundState === 'playing') {
+      const myEntry = guestRoomState.leaderboard.find((e) => e.memberId === guestMemberId);
+      const nextSt = myEntry?.roundStatus === 'correct' ? 'won' : 'gave-up';
+      setRoundState(nextSt);
+      setIsPlaying(true);
+      const provider = getPlaybackProviderForTrack(incomingTrack);
+      void provider.playFullTrack(incomingTrack, guestRoomState.startOffsetSec ?? 0).catch(() => {
+        setIsPlaying(false);
+      });
+    }
+  }, [
+    isRemoteGuestPlaying,
+    guestRoomState,
+    guestSyncedRoundNum,
+    roundState,
+    guestMemberId,
+    stopAllPlayback,
+  ]);
+
+  // Build the live PartyLeaderboardEntry[] sorted by totalScore then lowest snippet duration
   const partyLeaderboard = useMemo<PartyLeaderboardEntry[]>(() => {
     const entries: PartyLeaderboardEntry[] = partyMembers.map((m) => {
       const rState = roundPlayerStates[m.id];
@@ -533,7 +569,6 @@ export function App() {
         roundPoints: rState?.roundPoints ?? 0,
         wrongAttempts: rState?.wrongAttempts ?? 0,
         guessTimestampMs: rState?.guessTimestampMs,
-        guessElapsedSec: rState?.guessElapsedSec,
         guessSnippetSec: rState?.guessSnippetSec,
         lastGuessTitle: rState?.lastGuessTitle,
       };
@@ -541,16 +576,16 @@ export function App() {
 
     return entries.sort((a, b) => {
       if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
-      if (a.guessElapsedSec !== undefined && b.guessElapsedSec !== undefined) {
-        return a.guessElapsedSec - b.guessElapsedSec;
+      if (a.guessSnippetSec !== undefined && b.guessSnippetSec !== undefined) {
+        return a.guessSnippetSec - b.guessSnippetSec;
       }
       return 0;
     });
   }, [partyMembers, roundPlayerStates, partyScores]);
 
-  // Broadcast live room state from Host to all connected Guests whenever party/round state changes
+  // Broadcast live room state from Host to all connected Remote Guests
   useEffect(() => {
-    if (!isPartyMode || partyTab !== 'host' || !hostRoomCode) return;
+    if (!isOnlinePartyHost || !hostRoomCode) return;
 
     const status: PartyRoomStatePayload['status'] = isPartyLobbyOpen
       ? 'lobby'
@@ -569,26 +604,18 @@ export function App() {
       sharedMatchesCount: mergedPartyPool.sharedMatchesCount,
       totalTracksCount: mergedPartyPool.totalUniqueCount,
       roundNumber: roundHistory.length + (roundState === 'playing' ? 1 : 0),
-      roundStartedAtMs,
+      roundStartedAtMs: 0,
+      startOffsetSec,
       snippetDurationSec,
       maxUnlockedDurationSec,
       isPlayingAudio: isPlaying,
-      currentTrack: currentTrack
-        ? {
-            id: currentTrack.id,
-            title: currentTrack.title,
-            artist: currentTrack.artist,
-            artworkUrl: currentTrack.artworkUrl,
-            favoritedBy: currentTrack.favoritedBy,
-          }
-        : null,
+      currentTrack,
       leaderboard: partyLeaderboard,
     };
 
     partyRoomRef.current?.broadcastRoomState(statePayload);
   }, [
-    isPartyMode,
-    partyTab,
+    isOnlinePartyHost,
     hostRoomCode,
     isPartyLobbyOpen,
     view,
@@ -597,7 +624,7 @@ export function App() {
     mergedPartyPool.sharedMatchesCount,
     mergedPartyPool.totalUniqueCount,
     roundHistory.length,
-    roundStartedAtMs,
+    startOffsetSec,
     snippetDurationSec,
     maxUnlockedDurationSec,
     isPlaying,
@@ -607,10 +634,10 @@ export function App() {
 
   // Broadcast merged catalog search index whenever mergedPartyPool changes on the Host
   useEffect(() => {
-    if (isPartyMode && partyTab === 'host' && mergedPartyPool.tracks.length > 0) {
+    if (isOnlinePartyHost && mergedPartyPool.tracks.length > 0) {
       partyRoomRef.current?.broadcastCatalogIndex(mergedPartyPool.tracks);
     }
-  }, [isPartyMode, partyTab, mergedPartyPool.tracks]);
+  }, [isOnlinePartyHost, mergedPartyPool.tracks]);
 
   const cancelCurrentGame = useCallback(() => {
     stopAllPlayback();
@@ -627,6 +654,7 @@ export function App() {
     setMemberPickCounts({});
     setPartyScores({});
     setRoundPlayerStates({});
+    setGuestSyncedRoundNum(0);
     setSearchQuery('');
     setIsDropdownOpen(false);
     setView('quiz');
@@ -637,7 +665,6 @@ export function App() {
     }
   }, [stopAllPlayback]);
 
-  // Add or update a party member synchronously
   const addOrUpdatePartyMember = useCallback(
     (
       name: string,
@@ -649,7 +676,7 @@ export function App() {
       const cleanName = name.trim() || `Player ${currentList.length + 1}`;
       const explicitId = options?.explicitId;
       const isHost = options?.isHost ?? false;
-      const defaultReady = options?.isReady ?? isHost;
+      const defaultReady = options?.isReady ?? true;
 
       const existingIdx = currentList.findIndex(
         (m) =>
@@ -696,7 +723,7 @@ export function App() {
     []
   );
 
-  // Reveal the active party round when all players finish or host clicks Reveal
+  // Reveal the active Online Party round when all players finish or Host clicks Reveal
   const revealPartyRound = useCallback(
     (didAnyoneWin: boolean) => {
       const track = currentTrackRef.current;
@@ -715,7 +742,6 @@ export function App() {
 
       setUsedTrackIds((prev) => new Set(prev).add(track.id));
 
-      // Best points awarded across players this round
       const bestRoundPts = Math.max(
         0,
         ...Object.values(roundPlayerStatesRef.current).map((s) => s.roundPoints)
@@ -738,7 +764,7 @@ export function App() {
     [startOffsetSec]
   );
 
-  // Process a guess from either a Remote Guest or the Host in Party Mode
+  // Process a guess in Online Party Mode (Points based strictly on unlocked snippet duration, never counting down over time!)
   const handleProcessPartyGuess = useCallback(
     (guess: PartyGuessPayload) => {
       const track = currentTrackRef.current;
@@ -751,7 +777,6 @@ export function App() {
         wrongAttempts: 0,
       };
 
-      // Ignore if player already finished this round
       if (prevEntry.roundStatus !== 'guessing') return;
 
       const isMatch =
@@ -760,11 +785,10 @@ export function App() {
           (guess.trackTitle.toLowerCase() === track.title.toLowerCase() &&
             guess.trackArtist.toLowerCase() === track.artist.toLowerCase()));
 
-      const elapsedSec = Math.max(
-        0.1,
-        Number(((guess.timestampMs - roundStartedAtMsRef.current) / 1000).toFixed(2))
+      const playerUnlockedClipSec = Math.max(
+        MIN_SNIPPET_SECONDS,
+        guess.snippetDurationSec || MIN_SNIPPET_SECONDS
       );
-      const effectiveDur = Math.max(guess.snippetDurationSec || MIN_SNIPPET_SECONDS, maxUnlockedRef.current);
 
       if (guess.gaveUp) {
         currentStates[guess.memberId] = {
@@ -772,21 +796,16 @@ export function App() {
           roundStatus: 'gave-up',
           roundPoints: 0,
           guessTimestampMs: guess.timestampMs,
-          guessElapsedSec: elapsedSec,
+          guessSnippetSec: playerUnlockedClipSec,
         };
       } else if (isMatch) {
-        const awarded = calculateNetRoundScore(
-          effectiveDur,
-          prevEntry.wrongAttempts,
-          elapsedSec
-        );
+        const awarded = calculateNetRoundScore(playerUnlockedClipSec, prevEntry.wrongAttempts);
         currentStates[guess.memberId] = {
           ...prevEntry,
           roundStatus: 'correct',
           roundPoints: awarded,
           guessTimestampMs: guess.timestampMs,
-          guessElapsedSec: elapsedSec,
-          guessSnippetSec: effectiveDur,
+          guessSnippetSec: playerUnlockedClipSec,
           lastGuessTitle: guess.trackTitle,
         };
 
@@ -807,7 +826,6 @@ export function App() {
       roundPlayerStatesRef.current = currentStates;
       setRoundPlayerStates(currentStates);
 
-      // Check if all party members have completed their guess for this round
       const members = partyMembersRef.current;
       if (
         members.length > 0 &&
@@ -823,7 +841,6 @@ export function App() {
     [revealPartyRound]
   );
 
-  // Start or resume hosting a live party room
   const ensureHostingRoom = useCallback(
     async (forceNewCode = false) => {
       try {
@@ -837,7 +854,7 @@ export function App() {
                 {
                   explicitId: guestPayload.memberId,
                   isHost: false,
-                  isReady: false, // Remote guests explicitly mark when they are ready
+                  isReady: false, // Remote guests explicitly mark Ready
                 }
               );
               const merged = mergePartyCatalogs(updatedMembers);
@@ -879,14 +896,22 @@ export function App() {
   );
 
   useEffect(() => {
-    if ((gameMode === 'party' && partyTab === 'host') || getSavedHostRoomCode()) {
+    if (
+      (gameMode === 'party' && partyLocationMode === 'remote' && partyTab === 'host') ||
+      getSavedHostRoomCode()
+    ) {
       void ensureHostingRoom(false);
     }
-  }, [gameMode, partyTab, ensureHostingRoom]);
+  }, [gameMode, partyLocationMode, partyTab, ensureHostingRoom]);
 
-  // Connect guest listener automatically when on the Join tab with a valid 5-char code
+  // Connect guest listener automatically when in Remote Join mode with a valid 5-char code
   useEffect(() => {
-    if (gameMode === 'party' && partyTab === 'join' && joinRoomCode.trim().length >= 5) {
+    if (
+      gameMode === 'party' &&
+      partyLocationMode === 'remote' &&
+      partyTab === 'join' &&
+      joinRoomCode.trim().length >= 5
+    ) {
       partyRoomRef.current?.connectAsGuest(joinRoomCode, {
         onRoomState: (state) => {
           setGuestRoomState(state);
@@ -900,7 +925,7 @@ export function App() {
         },
       });
     }
-  }, [gameMode, partyTab, joinRoomCode, guestMemberId]);
+  }, [gameMode, partyLocationMode, partyTab, joinRoomCode, guestMemberId]);
 
   const startNewRound = async (pool: Track[] = catalog, forcePartyMode = isPartyMode) => {
     if (pool.length === 0) return;
@@ -924,11 +949,8 @@ export function App() {
       chosen = candidatePool[Math.floor(Math.random() * candidatePool.length)];
     }
 
-    const nowMs = Date.now();
     currentTrackRef.current = chosen;
     setCurrentTrack(chosen);
-    roundStartedAtMsRef.current = nowMs;
-    setRoundStartedAtMs(nowMs);
     setSnippetDurationSec(MIN_SNIPPET_SECONDS);
     maxUnlockedRef.current = MIN_SNIPPET_SECONDS;
     setMaxUnlockedDurationSec(MIN_SNIPPET_SECONDS);
@@ -943,6 +965,12 @@ export function App() {
     try {
       const playbackProvider = getPlaybackProviderForTrack(chosen);
       const { durationSec } = await playbackProvider.cueTrack(chosen);
+      // If SpotifyProvider resolved a YouTube videoId on cueTrack, keep it on currentTrack so Remote Guests can play it directly
+      if (chosen.videoId && currentTrackRef.current?.id === chosen.id) {
+        const enriched = { ...chosen };
+        currentTrackRef.current = enriched;
+        setCurrentTrack(enriched);
+      }
       if (offsetMode === 'random' && durationSec && durationSec > 45) {
         const safeMaxStart = Math.max(0, Math.floor(durationSec - 35));
         setStartOffsetSec(Math.floor(Math.random() * safeMaxStart));
@@ -971,7 +999,6 @@ export function App() {
 
     if (nextMode === 'party') {
       setIsPartyLobbyOpen(true);
-      void ensureHostingRoom(false);
     } else {
       setIsPartyLobbyOpen(false);
       try {
@@ -986,6 +1013,19 @@ export function App() {
       if (cached.length > 0) {
         void startNewRound(cached, false);
       }
+    }
+  };
+
+  const handleSelectPartyLocationMode = (nextLocMode: PartyLocationMode) => {
+    if (nextLocMode === partyLocationMode) return;
+    cancelCurrentGame();
+    setPartyLocationMode(nextLocMode);
+    setIsPartyLobbyOpen(true);
+    if (nextLocMode === 'local') {
+      // In Same-Room Local mode, mark all members as Ready automatically
+      const updated = partyMembersRef.current.map((m) => ({ ...m, isReady: true }));
+      partyMembersRef.current = updated;
+      setPartyMembers(updated);
     }
   };
 
@@ -1061,6 +1101,7 @@ export function App() {
             const pending = JSON.parse(pendingRaw) as PendingPartyAction;
             if (Date.now() - (pending.createdAt ?? 0) < 15 * 60 * 1000) {
               setGameMode('party');
+              setPartyLocationMode(pending.locationMode || 'local');
               setIsPartyLobbyOpen(true);
               if (pending.mode === 'host-add') {
                 setPartyTab('host');
@@ -1070,12 +1111,12 @@ export function App() {
                   isReady: true,
                 });
               } else if (pending.mode === 'local-add') {
-                setPartyTab('host');
                 addOrUpdatePartyMember(pending.playerName, 'spotify', tracks, {
                   isHost: false,
                   isReady: true,
                 });
               } else if (pending.mode === 'remote-join' && pending.roomCode) {
+                setPartyLocationMode('remote');
                 setPartyTab('join');
                 setJoinRoomCode(pending.roomCode);
                 setNewPlayerName(pending.playerName);
@@ -1119,13 +1160,10 @@ export function App() {
     [guesses]
   );
 
+  // Points depend strictly on unlocked snippet duration and wrong guesses (no time countdown!)
   const effectiveScoringDuration = Math.max(snippetDurationSec, maxUnlockedDurationSec);
   const baseCurvePoints = calculateLogarithmicBaseScore(effectiveScoringDuration);
-  const potentialNetPoints = calculateNetRoundScore(
-    effectiveScoringDuration,
-    wrongGuessesCount,
-    liveRoundTimerSec
-  );
+  const potentialNetPoints = calculateNetRoundScore(effectiveScoringDuration, wrongGuessesCount);
   const runningTotalScore = useMemo(
     () => roundHistory.reduce((sum, r) => sum + r.pointsAwarded, 0),
     [roundHistory]
@@ -1187,6 +1225,7 @@ export function App() {
         localStorage.setItem(
           STORAGE_KEY_PENDING_PARTY_ACTION,
           JSON.stringify({
+            locationMode: partyLocationMode,
             mode: asHost ? 'host-add' : 'local-add',
             playerName: cleanName,
             provider: 'spotify',
@@ -1263,6 +1302,7 @@ export function App() {
         localStorage.setItem(
           STORAGE_KEY_PENDING_PARTY_ACTION,
           JSON.stringify({
+            locationMode: 'remote',
             mode: 'remote-join',
             playerName: cleanName,
             provider: 'spotify',
@@ -1293,7 +1333,6 @@ export function App() {
     }
   };
 
-  // Remote Guest toggles their Ready state
   const handleToggleGuestReady = () => {
     const nextReady = !guestIsReady;
     setGuestIsReady(nextReady);
@@ -1305,7 +1344,6 @@ export function App() {
     );
   };
 
-  // Host toggles a member's Ready state directly if needed
   const handleHostToggleMemberReady = (memberId: string) => {
     const updated = partyMembersRef.current.map((m) =>
       m.id === memberId ? { ...m, isReady: !m.isReady } : m
@@ -1359,7 +1397,9 @@ export function App() {
     partyMembersRef.current = [];
     setPartyMembers([]);
     setIsPartyLobbyOpen(true);
-    void ensureHostingRoom(true);
+    if (partyLocationMode === 'remote') {
+      void ensureHostingRoom(true);
+    }
   };
 
   const handleDisconnect = () => {
@@ -1431,13 +1471,6 @@ export function App() {
     }
   };
 
-  // Search pool: for remote guests in Party Mode, use guestCatalog (or fallback to local cached songs)
-  const isRemoteGuestPlaying =
-    isPartyMode &&
-    partyTab === 'join' &&
-    guestRoomState &&
-    (guestRoomState.status === 'playing' || guestRoomState.status === 'revealed');
-
   const searchablePool = useMemo<PartyCatalogItem[]>(() => {
     if (isRemoteGuestPlaying) {
       if (guestCatalog.length > 0) return guestCatalog;
@@ -1460,51 +1493,46 @@ export function App() {
     }));
   }, [isRemoteGuestPlaying, guestCatalog, newPlayerProvider, catalog]);
 
-  const activeAttemptList = isRemoteGuestPlaying ? guestGuesses : guesses;
-
   const filteredSuggestions = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return [];
-    const guessedIds = new Set(activeAttemptList.map((g) => g.trackId));
+    const guessedIds = new Set(guesses.map((g) => g.trackId));
     return searchablePool
       .filter((t) => {
         if (guessedIds.has(t.id)) return false;
         return t.title.toLowerCase().includes(q) || t.artist.toLowerCase().includes(q);
       })
       .slice(0, 6);
-  }, [searchablePool, searchQuery, activeAttemptList]);
+  }, [searchablePool, searchQuery, guesses]);
 
-  // Submit a guess on either the Remote Guest interface or the Host/Solo interface
+  // Submit a guess (In every mode, uses the player's own unlocked snippet duration!)
   const submitGuess = (guessedItem: PartyCatalogItem) => {
+    if (!currentTrack || roundState !== 'playing') return;
+
     setSearchQuery('');
     setIsDropdownOpen(false);
 
-    // 1. Remote Guest submits a timestamped guess from their own device
+    const isCorrect =
+      guessedItem.id === currentTrack.id ||
+      (guessedItem.title.toLowerCase() === currentTrack.title.toLowerCase() &&
+        guessedItem.artist.toLowerCase() === currentTrack.artist.toLowerCase());
+
+    const usedDur = Math.max(snippetDurationSec, maxUnlockedDurationSec);
+    const nowMs = Date.now();
+
+    const nextGuess: RoundGuess = {
+      trackId: guessedItem.id,
+      title: guessedItem.title,
+      artist: guessedItem.artist,
+      snippetDurationAtGuessSec: usedDur,
+      correct: isCorrect,
+    };
+
+    const updatedGuesses = [...guesses, nextGuess];
+    setGuesses(updatedGuesses);
+
+    // 1. Remote Guest in Online Party Mode
     if (isRemoteGuestPlaying && guestRoomState) {
-      if (!guestRoomState.currentTrack || guestRoomState.status !== 'playing') return;
-      const target = guestRoomState.currentTrack;
-      const isCorrect =
-        guessedItem.id === target.id ||
-        (guessedItem.title.toLowerCase() === target.title.toLowerCase() &&
-          guessedItem.artist.toLowerCase() === target.artist.toLowerCase());
-
-      const nowMs = Date.now();
-      const elapsedSec = Math.max(
-        0.1,
-        Number(((nowMs - guestRoomState.roundStartedAtMs) / 1000).toFixed(2))
-      );
-      const clipSec = guestRoomState.maxUnlockedDurationSec || guestRoomState.snippetDurationSec;
-
-      const nextGuess: RoundGuess = {
-        trackId: guessedItem.id,
-        title: guessedItem.title,
-        artist: guessedItem.artist,
-        snippetDurationAtGuessSec: clipSec,
-        guessElapsedSec: elapsedSec,
-        correct: isCorrect,
-      };
-      setGuestGuesses((prev) => [...prev, nextGuess]);
-
       partyRoomRef.current?.sendGuestGuess(joinRoomCode, {
         guessId: `g-${guestMemberId}-${nowMs}`,
         roundNumber: guestRoomState.roundNumber,
@@ -1515,42 +1543,23 @@ export function App() {
         trackArtist: guessedItem.artist,
         correct: isCorrect,
         timestampMs: nowMs,
-        elapsedSec,
-        snippetDurationSec: clipSec,
+        elapsedSec: usedDur,
+        snippetDurationSec: usedDur,
       });
+
+      if (isCorrect) {
+        setIsPlaying(true);
+        const playbackProvider = getPlaybackProviderForTrack(currentTrack);
+        void playbackProvider.playFullTrack(currentTrack, startOffsetSec).catch(() => {
+          setIsPlaying(false);
+        });
+      }
       return;
     }
 
-    // 2. Host or Solo player submits a timestamped guess
-    if (!currentTrack || roundState !== 'playing') return;
-
-    const isCorrect =
-      guessedItem.id === currentTrack.id ||
-      (guessedItem.title.toLowerCase() === currentTrack.title.toLowerCase() &&
-        guessedItem.artist.toLowerCase() === currentTrack.artist.toLowerCase());
-
-    const nowMs = Date.now();
-    const elapsedSec = Math.max(
-      0.1,
-      Number(((nowMs - roundStartedAtMs) / 1000).toFixed(2))
-    );
-    const usedDur = Math.max(snippetDurationSec, maxUnlockedDurationSec);
-
-    const nextGuess: RoundGuess = {
-      trackId: guessedItem.id,
-      title: guessedItem.title,
-      artist: guessedItem.artist,
-      snippetDurationAtGuessSec: usedDur,
-      guessElapsedSec: elapsedSec,
-      correct: isCorrect,
-    };
-
-    const updatedGuesses = [...guesses, nextGuess];
-    setGuesses(updatedGuesses);
-
-    if (isPartyMode) {
-      const hostMember =
-        partyMembers.find((m) => m.isHost) ?? partyMembers[0];
+    // 2. Host in Online Party Mode
+    if (isOnlinePartyHost) {
+      const hostMember = partyMembers.find((m) => m.isHost) ?? partyMembers[0];
       if (hostMember) {
         handleProcessPartyGuess({
           type: 'PARTY_PLAYER_GUESS',
@@ -1563,15 +1572,16 @@ export function App() {
           trackArtist: guessedItem.artist,
           correct: isCorrect,
           timestampMs: nowMs,
-          elapsedSec,
+          elapsedSec: usedDur,
           snippetDurationSec: usedDur,
         });
       }
       return;
     }
 
+    // 3. Solo Mode or Same-Room Local Party Mode
     if (isCorrect) {
-      const awarded = calculateNetRoundScore(usedDur, wrongGuessesCount, elapsedSec);
+      const awarded = calculateNetRoundScore(usedDur, wrongGuessesCount);
       setRoundState('won');
       setIsPlaying(true);
       const playbackProvider = getPlaybackProviderForTrack(currentTrack);
@@ -1586,7 +1596,6 @@ export function App() {
           targetTrack: currentTrack,
           status: 'won',
           unlockedDurationSec: usedDur,
-          guessElapsedSec: elapsedSec,
           startOffsetSec,
           wrongGuesses: wrongGuessesCount,
           guesses: updatedGuesses,
@@ -1598,12 +1607,9 @@ export function App() {
 
   const handleGiveUp = () => {
     const nowMs = Date.now();
+    const usedDur = Math.max(snippetDurationSec, maxUnlockedDurationSec);
 
     if (isRemoteGuestPlaying && guestRoomState) {
-      const elapsedSec = Math.max(
-        0.1,
-        Number(((nowMs - guestRoomState.roundStartedAtMs) / 1000).toFixed(2))
-      );
       partyRoomRef.current?.sendGuestGuess(joinRoomCode, {
         guessId: `giveup-${guestMemberId}-${nowMs}`,
         roundNumber: guestRoomState.roundNumber,
@@ -1615,21 +1621,17 @@ export function App() {
         correct: false,
         gaveUp: true,
         timestampMs: nowMs,
-        elapsedSec,
-        snippetDurationSec: guestRoomState.maxUnlockedDurationSec,
+        elapsedSec: usedDur,
+        snippetDurationSec: usedDur,
       });
       return;
     }
 
     if (!currentTrack || roundState !== 'playing') return;
 
-    if (isPartyMode) {
+    if (isOnlinePartyHost) {
       const hostMember = partyMembers.find((m) => m.isHost) ?? partyMembers[0];
       if (hostMember) {
-        const elapsedSec = Math.max(
-          0.1,
-          Number(((nowMs - roundStartedAtMs) / 1000).toFixed(2))
-        );
         handleProcessPartyGuess({
           type: 'PARTY_PLAYER_GUESS',
           guessId: `giveup-${hostMember.id}-${nowMs}`,
@@ -1642,8 +1644,8 @@ export function App() {
           correct: false,
           gaveUp: true,
           timestampMs: nowMs,
-          elapsedSec,
-          snippetDurationSec: Math.max(snippetDurationSec, maxUnlockedDurationSec),
+          elapsedSec: usedDur,
+          snippetDurationSec: usedDur,
         });
       } else {
         revealPartyRound(false);
@@ -1651,7 +1653,6 @@ export function App() {
       return;
     }
 
-    const usedDur = Math.max(snippetDurationSec, maxUnlockedDurationSec);
     setRoundState('gave-up');
     setIsPlaying(true);
     const playbackProvider = getPlaybackProviderForTrack(currentTrack);
@@ -1688,7 +1689,7 @@ export function App() {
   }, [newPlayerProvider, soloCatalog]);
 
   const hostMemberEntry = useMemo(
-    () => partyMembers.find((m) => m.isHost),
+    () => partyMembers.find((m) => m.isHost) ?? partyMembers[0],
     [partyMembers]
   );
   const hostRoundStatus = hostMemberEntry
@@ -1699,6 +1700,18 @@ export function App() {
     () => guestRoomState?.leaderboard.find((e) => e.memberId === guestMemberId),
     [guestRoomState, guestMemberId]
   );
+
+  const activeOnlineStatus = isRemoteGuestPlaying
+    ? guestMyEntry?.roundStatus ?? 'guessing'
+    : isOnlinePartyHost
+      ? hostRoundStatus
+      : 'guessing';
+
+  const activeLeaderboard = isRemoteGuestPlaying
+    ? guestRoomState?.leaderboard ?? []
+    : isOnlinePartyHost
+      ? partyLeaderboard
+      : [];
 
   const ranking = useMemo(() => evaluateRunRanking(roundHistory), [roundHistory]);
   const unlockedPercent = (snippetDurationSec / MAX_SNIPPET_SECONDS) * 100;
@@ -1719,18 +1732,28 @@ export function App() {
           </div>
 
           <div className="nav-right">
-            {catalog.length > 0 && (!isPartyMode || !isPartyLobbyOpen) && (
+            {((catalog.length > 0 && (!isPartyMode || !isPartyLobbyOpen)) ||
+              isRemoteGuestPlaying) && (
               <div className="session-scoreboard">
                 <div className="score-chip">
                   <span className="chip-label">
-                    R{view === 'summary' ? roundHistory.length : roundHistory.length + 1}
+                    R
+                    {isRemoteGuestPlaying && guestRoomState
+                      ? guestRoomState.roundNumber
+                      : view === 'summary'
+                        ? roundHistory.length
+                        : roundHistory.length + 1}
                   </span>
                 </div>
                 <div className="score-chip accent">
                   <Trophy size={13} />
-                  <span className="chip-val">{runningTotalScore.toLocaleString()}</span>
+                  <span className="chip-val">
+                    {isRemoteGuestPlaying
+                      ? (guestMyEntry?.totalScore ?? 0).toLocaleString()
+                      : runningTotalScore.toLocaleString()}
+                  </span>
                 </div>
-                {roundHistory.length > 0 && (
+                {!isRemoteGuestPlaying && roundHistory.length > 0 && (
                   <button
                     type="button"
                     className="btn-ghost-pill"
@@ -1884,381 +1907,52 @@ export function App() {
         )}
 
         {/* ====================================================================
-            1A. REMOTE GUEST LIVE QUIZ INTERFACE (When Host Starts Party Quiz!)
+            1. PARTY MODE LOBBY VIEW (Differentiates Same-Room Local vs Remote Online)
             ==================================================================== */}
-        {isRemoteGuestPlaying && guestRoomState ? (
-          <section
-            className={`surface-card quiz-stage ${
-              guestRoomState.status === 'revealed' ? 'result-focused won' : ''
-            }`}
-          >
-            <ConfettiCanvas
-              active={
-                guestMyEntry?.roundStatus === 'correct' ||
-                guestRoomState.status === 'revealed'
-              }
-            />
-
-            <div className="party-active-bar">
-              <div className="party-roster-chips">
-                <span className="party-bar-label">
-                  <Users size={13} /> Room <strong>{guestRoomState.roomCode}</strong> · Host:{' '}
-                  <strong>{guestRoomState.hostName}</strong>
-                </span>
-              </div>
-              <button
-                type="button"
-                className="btn-party-lobby-link"
-                onClick={() => {
-                  setGuestRoomState(null);
-                  setGuestAck(null);
-                }}
-              >
-                Leave Room
-              </button>
-            </div>
-
-            {guestRoomState.status === 'playing' ? (
-              <>
-                {/* Guest Round & Timestamp Status Bar */}
-                <div className="stage-header">
-                  <div className="potential-score-box">
-                    <span className="stage-eyebrow">
-                      Round #{guestRoomState.roundNumber} · Your Score
-                    </span>
-                    <div className="points-display-row">
-                      <span className="points-value">
-                        {(guestMyEntry?.totalScore ?? 0).toLocaleString()}
-                      </span>
-                      <span className="points-unit">pts</span>
-                    </div>
-                  </div>
-
-                  <div className="snippet-length-box">
-                    <span className="stage-eyebrow">Elapsed / Clip</span>
-                    <div className="length-display-row">
-                      <Clock size={15} className="ear-icon" />
-                      <span className="length-value">{liveRoundTimerSec.toFixed(1)}s</span>
-                      <span className="length-max">
-                        · {guestRoomState.snippetDurationSec.toFixed(1)}s clip
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Guest Status or Search Input */}
-                {guestMyEntry?.roundStatus === 'correct' ? (
-                  <div className="guest-locked-banner correct">
-                    <CheckCircle2 size={20} />
-                    <div>
-                      <strong>
-                        Correct! Locked in at {guestMyEntry.guessElapsedSec?.toFixed(2)}s
-                      </strong>
-                      <span>
-                        +{guestMyEntry.roundPoints.toLocaleString()} pts awarded · Waiting for
-                        other players...
-                      </span>
-                    </div>
-                  </div>
-                ) : guestMyEntry?.roundStatus === 'gave-up' ? (
-                  <div className="guest-locked-banner skipped">
-                    <Flag size={18} />
-                    <div>
-                      <strong>Round Passed</strong>
-                      <span>Waiting for other players to finish guessing...</span>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="guess-zone">
-                    <div className="search-bar-container">
-                      <div className="search-field-box">
-                        <Search className="search-icon" size={18} />
-                        <input
-                          ref={searchInputRef}
-                          type="text"
-                          className="search-input"
-                          placeholder={`Guess song (${searchablePool.length} in party pool)...`}
-                          value={searchQuery}
-                          onFocus={() => setIsDropdownOpen(true)}
-                          onChange={(e) => {
-                            setSearchQuery(e.target.value);
-                            setSelectedSuggestionIdx(0);
-                            setIsDropdownOpen(true);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === 'ArrowDown') {
-                              e.preventDefault();
-                              setSelectedSuggestionIdx((i) =>
-                                Math.min(i + 1, Math.max(0, filteredSuggestions.length - 1))
-                              );
-                            } else if (e.key === 'ArrowUp') {
-                              e.preventDefault();
-                              setSelectedSuggestionIdx((i) => Math.max(0, i - 1));
-                            } else if (
-                              e.key === 'Enter' &&
-                              filteredSuggestions[selectedSuggestionIdx]
-                            ) {
-                              e.preventDefault();
-                              submitGuess(filteredSuggestions[selectedSuggestionIdx]);
-                            } else if (e.key === 'Escape') {
-                              setIsDropdownOpen(false);
-                            }
-                          }}
-                        />
-                        {searchQuery && (
-                          <button
-                            type="button"
-                            className="clear-search-btn"
-                            onClick={() => {
-                              setSearchQuery('');
-                              searchInputRef.current?.focus();
-                            }}
-                            aria-label="Clear search"
-                          >
-                            <X size={16} />
-                          </button>
-                        )}
-                      </div>
-
-                      <button
-                        type="button"
-                        className="btn-skip-round"
-                        onClick={handleGiveUp}
-                      >
-                        <Flag size={14} />
-                        <span>Pass</span>
-                      </button>
-                    </div>
-
-                    {isDropdownOpen && searchQuery.trim().length > 0 && (
-                      <div className="suggestions-popover" role="listbox">
-                        {filteredSuggestions.length > 0 ? (
-                          filteredSuggestions.map((track, idx) => (
-                            <button
-                              key={track.id}
-                              type="button"
-                              role="option"
-                              aria-selected={idx === selectedSuggestionIdx}
-                              className={`suggestion-row ${
-                                idx === selectedSuggestionIdx ? 'selected' : ''
-                              }`}
-                              onMouseEnter={() => setSelectedSuggestionIdx(idx)}
-                              onMouseDown={(e) => {
-                                e.preventDefault();
-                                submitGuess(track);
-                              }}
-                            >
-                              {track.artworkUrl ? (
-                                <img src={track.artworkUrl} alt="" className="suggestion-art" />
-                              ) : (
-                                <div className="suggestion-art-fallback">
-                                  <Music2 size={14} />
-                                </div>
-                              )}
-                              <div className="suggestion-text">
-                                <span className="suggestion-title">{track.title}</span>
-                                <span className="suggestion-artist">{track.artist}</span>
-                              </div>
-                              <span className="suggestion-submit-hint">Guess</span>
-                            </button>
-                          ))
-                        ) : (
-                          <div className="suggestions-empty">No matching songs found.</div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </>
-            ) : (
-              /* Guest View of Revealed Song */
-              guestRoomState.currentTrack && (
-                <div className="result-spotlight won">
-                  <div className="spotlight-badge-row">
-                    <span className="spotlight-status won">
-                      <CheckCircle2 size={16} />
-                      <span>Round #{guestRoomState.roundNumber} Revealed</span>
-                    </span>
-                    <span className="spotlight-points-award">
-                      +{guestMyEntry?.roundPoints.toLocaleString() ?? 0} pts
-                    </span>
-                  </div>
-
-                  <div className="spotlight-stage">
-                    <div className="spotlight-cover-wrap playing">
-                      {guestRoomState.currentTrack.artworkUrl ? (
-                        <img
-                          src={guestRoomState.currentTrack.artworkUrl}
-                          alt={guestRoomState.currentTrack.title}
-                          className="spotlight-cover"
-                        />
-                      ) : (
-                        <div className="spotlight-cover-fallback">
-                          <Disc3 className="spin-slow" size={42} />
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="spotlight-meta">
-                      <h2 className="spotlight-title">{guestRoomState.currentTrack.title}</h2>
-                      <p className="spotlight-artist">{guestRoomState.currentTrack.artist}</p>
-
-                      {guestRoomState.currentTrack.favoritedBy &&
-                        guestRoomState.currentTrack.favoritedBy.length > 0 && (
-                          <div className="favorited-by-block">
-                            <span className="favorited-by-label">
-                              <Heart size={12} className="heart-icon" /> Favorited by:
-                            </span>
-                            <div className="favorited-by-pills">
-                              {guestRoomState.currentTrack.favoritedBy.map((fav) => (
-                                <span
-                                  key={fav.memberId}
-                                  className="favorited-user-pill"
-                                  style={{ borderColor: fav.color }}
-                                >
-                                  <span
-                                    className="fav-dot"
-                                    style={{ backgroundColor: fav.color }}
-                                  />
-                                  <strong>{fav.name}</strong>
-                                </span>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                    </div>
-                  </div>
-                </div>
-              )
-            )}
-
-            {/* Live Party Scoreboard & Guess Timestamps */}
-            <div className="party-live-board">
-              <div className="attempts-header">
-                <span>Live Party Standings & Guess Timestamps</span>
-                <span>Ranked by Score & Speed</span>
-              </div>
-              <div className="member-list">
-                {guestRoomState.leaderboard.map((entry, idx) => (
-                  <div key={entry.memberId} className="member-row">
-                    <span className="rank-num">#{idx + 1}</span>
-                    <span
-                      className="member-dot"
-                      style={{ backgroundColor: entry.color }}
-                    />
-                    <div className="member-info">
-                      <strong>
-                        {entry.name} {entry.memberId === guestMemberId ? '(You)' : ''}
-                      </strong>
-                      <span>
-                        {entry.roundStatus === 'correct'
-                          ? `✓ ${entry.guessElapsedSec?.toFixed(2)}s (+${entry.roundPoints.toLocaleString()})`
-                          : entry.roundStatus === 'gave-up'
-                            ? 'Passed'
-                            : entry.wrongAttempts > 0
-                              ? `Guessing (${entry.wrongAttempts} wrong)`
-                              : 'Guessing...'}
-                      </span>
-                    </div>
-                    <span className="board-total-pts">
-                      {entry.totalScore.toLocaleString()} pts
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {guestGuesses.length > 0 && (
-              <div className="attempts-section">
-                <div className="attempts-header">
-                  <span>Your Guesses This Round ({guestGuesses.length})</span>
-                </div>
-                <div className="attempts-list">
-                  {guestGuesses.map((g, idx) => (
-                    <div
-                      key={`${g.trackId}-${idx}`}
-                      className={`attempt-item ${g.correct ? 'correct' : 'wrong'}`}
-                    >
-                      {g.correct ? <CheckCircle2 size={15} /> : <XCircle size={15} />}
-                      <div className="attempt-song">
-                        <strong>{g.title}</strong>
-                        <span>{g.artist}</span>
-                      </div>
-                      <span className="attempt-badge">
-                        @{g.guessElapsedSec?.toFixed(1)}s
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </section>
-        ) : isPartyMode && (isPartyLobbyOpen || catalog.length === 0) ? (
-          /* ==================================================================
-             1B. PARTY MODE LOBBY VIEW (Host Setup + Ready Gate & Guest Ready)
-             ================================================================== */
+        {isPartyMode && !isRemoteGuestPlaying && (isPartyLobbyOpen || catalog.length === 0) ? (
           <section className="surface-card party-lobby-card" aria-label="Party Mode Lobby">
-            <div className="party-mode-tabs">
+            {/* Top-Level Party Differentiation: Same Room (Local) vs Different Locations (Online) */}
+            <div className="party-location-switcher">
               <button
                 type="button"
-                className={`party-tab-btn ${partyTab === 'host' ? 'active' : ''}`}
-                onClick={() => setPartyTab('host')}
+                className={`party-loc-btn ${partyLocationMode === 'local' ? 'active' : ''}`}
+                onClick={() => handleSelectPartyLocationMode('local')}
               >
-                <Crown size={15} />
-                <span>Host Party ({partyMembers.length})</span>
+                <Home size={16} />
+                <div>
+                  <strong>Same Room (Local)</strong>
+                  <span>Play together on this device</span>
+                </div>
               </button>
               <button
                 type="button"
-                className={`party-tab-btn ${partyTab === 'join' ? 'active' : ''}`}
-                onClick={() => setPartyTab('join')}
+                className={`party-loc-btn ${partyLocationMode === 'remote' ? 'active' : ''}`}
+                onClick={() => handleSelectPartyLocationMode('remote')}
               >
-                <Send size={15} />
-                <span>Join Room Code</span>
+                <Globe size={16} />
+                <div>
+                  <strong>Online Room (Remote)</strong>
+                  <span>Join via Room Code on own devices</span>
+                </div>
               </button>
             </div>
 
-            {partyTab === 'host' ? (
+            {partyLocationMode === 'local' ? (
+              /* ==============================================================
+                 SAME ROOM (LOCAL) PARTY SETUP — Shared Device, No Room Code
+                 ============================================================== */
               <div className="party-host-stack">
-                {/* Auto-Hosted Room Code Banner */}
-                <div className="room-code-banner">
-                  <div className="room-code-badge">
-                    <span className="code-label">LIVE ROOM CODE (SHARE WITH FRIENDS)</span>
-                    <div className="code-value-row">
-                      <span className="code-value">{hostRoomCode ?? '...'}</span>
-                      <button
-                        type="button"
-                        className="btn-icon-mini"
-                        onClick={() => void handleManualRoomRefresh()}
-                        title="Check for joined players now"
-                        aria-label="Check for joined players"
-                      >
-                        <RefreshCw className={isPollingRoom ? 'spin' : ''} size={14} />
-                      </button>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    className="btn-secondary btn-share-invite"
-                    disabled={!hostRoomCode}
-                    onClick={() => void handleShareOrCopyInvite()}
-                  >
-                    {copiedLink ? <Check size={15} /> : <Share2 size={15} />}
-                    <span>{copiedLink ? 'Link Copied!' : 'Share Invite Link'}</span>
-                  </button>
-                </div>
-
-                {/* Host Name & Host Library Setup */}
                 <div className="party-add-card">
                   <span className="section-label">
-                    <Crown size={12} /> Your Host Name & Music Library
+                    <UserPlus size={13} /> Add Players in This Room
                   </span>
                   <div className="party-form-row">
                     <input
                       type="text"
                       className="party-text-input"
-                      placeholder="Your Host Name (e.g. Thomas)"
-                      value={hostName}
-                      onChange={(e) => handleHostNameChange(e.target.value)}
+                      placeholder={`Player Name (e.g. Player ${partyMembers.length + 1})`}
+                      value={newPlayerName}
+                      onChange={(e) => handlePlayerNameChange(e.target.value)}
                     />
                     <div className="provider-segmented">
                       <button
@@ -2287,11 +1981,11 @@ export function App() {
                       <button
                         type="button"
                         className="btn-secondary"
-                        onClick={() => void handleAddHostOrLocalPlayer(true, true)}
+                        onClick={() => void handleAddHostOrLocalPlayer(false, true)}
                       >
                         <Check size={14} />
                         <span>
-                          Use Saved as {hostName.trim() || 'Host'} ({selectedPartyProviderCachedCount})
+                          + Add Saved ({selectedPartyProviderCachedCount} songs)
                         </span>
                       </button>
                     )}
@@ -2299,25 +1993,24 @@ export function App() {
                       type="button"
                       className="btn-primary"
                       disabled={isLoadingLibrary}
-                      onClick={() => void handleAddHostOrLocalPlayer(true, false)}
+                      onClick={() => void handleAddHostOrLocalPlayer(false, false)}
                     >
                       <UserPlus size={15} />
                       <span>
                         {isLoadingLibrary
                           ? 'Syncing...'
-                          : `Connect ${
+                          : `Sign In & Add (${
                               newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
-                            } as ${hostName.trim() || 'Host'}`}
+                            })`}
                       </span>
                     </button>
                   </div>
                 </div>
 
-                {/* Roster, Ready Status & Start Party Quiz Gate */}
                 <div className="party-roster-card">
                   <div className="roster-header">
                     <span className="section-label">
-                      Party Roster ({partyMembers.length} Joined)
+                      Local Party Roster ({partyMembers.length} Players)
                     </span>
                     {partyMembers.length > 0 && (
                       <button
@@ -2326,15 +2019,15 @@ export function App() {
                         onClick={handleClearParty}
                       >
                         <Trash2 size={13} />
-                        <span>Reset Room</span>
+                        <span>Clear</span>
                       </button>
                     )}
                   </div>
 
                   {partyMembers.length === 0 ? (
                     <p className="party-empty-hint">
-                      Set your Host Name above and connect your library, or share the Room Code so
-                      friends can join and mark themselves Ready!
+                      Add 2 or more friends on this device with YouTube Music or Spotify. Exact
+                      shared songs play first, followed by fair rotation!
                     </p>
                   ) : (
                     <>
@@ -2357,22 +2050,12 @@ export function App() {
                               style={{ backgroundColor: member.color }}
                             />
                             <div className="member-info">
-                              <strong>
-                                {member.name} {member.isHost ? '(Host)' : ''}
-                              </strong>
+                              <strong>{member.name}</strong>
                               <span>
                                 {member.provider === 'youtube-music' ? 'YouTube' : 'Spotify'} ·{' '}
                                 {member.tracks.length} songs
                               </span>
                             </div>
-                            <button
-                              type="button"
-                              className={`ready-pill ${member.isReady ? 'ready' : 'waiting'}`}
-                              onClick={() => handleHostToggleMemberReady(member.id)}
-                              title="Click to toggle Ready status"
-                            >
-                              {member.isReady ? 'Ready ✓' : 'Waiting...'}
-                            </button>
                             <button
                               type="button"
                               className="member-remove"
@@ -2388,7 +2071,6 @@ export function App() {
                       <button
                         type="button"
                         className="btn-primary btn-full-width"
-                        disabled={!allPartyMembersReady}
                         onClick={() => {
                           cancelCurrentGame();
                           setIsPartyLobbyOpen(false);
@@ -2397,11 +2079,7 @@ export function App() {
                       >
                         <Play size={16} />
                         <span>
-                          {!allPartyMembersReady
-                            ? `Waiting for ${unreadyPartyMembersCount} player${
-                                unreadyPartyMembersCount > 1 ? 's' : ''
-                              } to Ready Up...`
-                            : `Start Party Quiz (${mergedPartyPool.totalUniqueCount} Songs)`}
+                          Start Local Party Quiz ({mergedPartyPool.totalUniqueCount} Songs)
                         </span>
                       </button>
                     </>
@@ -2409,142 +2087,362 @@ export function App() {
                 </div>
               </div>
             ) : (
-              /* Remote Guest Join & Ready Lobby Tab */
-              <div className="party-join-panel">
-                <p className="join-lead">
-                  Enter the host&apos;s 5-character Room Code, sync your library, and tap{' '}
-                  <strong>I&apos;m Ready</strong> so the host can start the quiz!
-                </p>
-
-                <div className="join-fields-stack">
-                  <div className="join-inputs-row">
-                    <input
-                      type="text"
-                      maxLength={6}
-                      className="party-text-input code-input"
-                      placeholder="CODE"
-                      value={joinRoomCode}
-                      onChange={(e) => handleJoinCodeChange(e.target.value)}
-                    />
-                    <input
-                      type="text"
-                      className="party-text-input"
-                      placeholder="Your Name"
-                      value={newPlayerName}
-                      onChange={(e) => handlePlayerNameChange(e.target.value)}
-                    />
-                  </div>
-
-                  <div className="provider-segmented full-width">
-                    <button
-                      type="button"
-                      className={`seg-btn ${
-                        newPlayerProvider === 'youtube-music' ? 'active' : ''
-                      }`}
-                      onClick={() => setNewPlayerProvider('youtube-music')}
-                    >
-                      <Music2 size={14} />
-                      <span>YouTube Music</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
-                      onClick={() => setNewPlayerProvider('spotify')}
-                    >
-                      <Sparkles size={14} />
-                      <span>Spotify</span>
-                    </button>
-                  </div>
-                </div>
-
-                <div className="party-btn-row">
-                  {selectedPartyProviderCachedCount > 0 && (
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      disabled={isLoadingLibrary}
-                      onClick={() => void handleGuestJoinAndSend(true)}
-                    >
-                      <Send size={15} />
-                      <span>Send Saved ({selectedPartyProviderCachedCount} songs)</span>
-                    </button>
-                  )}
-
+              /* ==============================================================
+                 ONLINE ROOM (REMOTE) PARTY SETUP — Multi-Device via Room Code
+                 ============================================================== */
+              <>
+                <div className="party-mode-tabs">
                   <button
                     type="button"
-                    className="btn-primary"
-                    disabled={isLoadingLibrary}
-                    onClick={() => void handleGuestJoinAndSend(false)}
+                    className={`party-tab-btn ${partyTab === 'host' ? 'active' : ''}`}
+                    onClick={() => setPartyTab('host')}
+                  >
+                    <Crown size={15} />
+                    <span>Host Online Room ({partyMembers.length})</span>
+                  </button>
+                  <button
+                    type="button"
+                    className={`party-tab-btn ${partyTab === 'join' ? 'active' : ''}`}
+                    onClick={() => setPartyTab('join')}
                   >
                     <Send size={15} />
-                    <span>
-                      {isLoadingLibrary
-                        ? 'Connecting & Sending...'
-                        : `Sign In & Join (${
-                            newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
-                          })`}
-                    </span>
+                    <span>Join with Room Code</span>
                   </button>
                 </div>
 
-                {/* Guest Ready Toggle & Live Room Status once joined */}
-                {(guestAck || guestRoomState) && (
-                  <div className="guest-ready-card">
-                    <div className="guest-ack-banner">
-                      <CheckCircle2 size={18} />
-                      <span>
-                        Connected to Room{' '}
-                        <strong>{guestRoomState?.roomCode ?? guestAck?.roomCode}</strong>
-                        {guestRoomState ? (
-                          <>
-                            {' '}
-                            (Host: <strong>{guestRoomState.hostName}</strong> ·{' '}
-                            <strong>{guestRoomState.totalTracksCount} songs</strong>)
-                          </>
-                        ) : null}
-                      </span>
+                {partyTab === 'host' ? (
+                  <div className="party-host-stack">
+                    <div className="room-code-banner">
+                      <div className="room-code-badge">
+                        <span className="code-label">ONLINE ROOM CODE (SHARE WITH FRIENDS)</span>
+                        <div className="code-value-row">
+                          <span className="code-value">{hostRoomCode ?? '...'}</span>
+                          <button
+                            type="button"
+                            className="btn-icon-mini"
+                            onClick={() => void handleManualRoomRefresh()}
+                            title="Check for joined players now"
+                            aria-label="Check for joined players"
+                          >
+                            <RefreshCw className={isPollingRoom ? 'spin' : ''} size={14} />
+                          </button>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-secondary btn-share-invite"
+                        disabled={!hostRoomCode}
+                        onClick={() => void handleShareOrCopyInvite()}
+                      >
+                        {copiedLink ? <Check size={15} /> : <Share2 size={15} />}
+                        <span>{copiedLink ? 'Link Copied!' : 'Share Invite Link'}</span>
+                      </button>
                     </div>
 
-                    <button
-                      type="button"
-                      className={`btn-ready-toggle ${guestIsReady ? 'is-ready' : ''}`}
-                      onClick={handleToggleGuestReady}
-                    >
-                      <UserCheck size={18} />
-                      <span>
-                        {guestIsReady
-                          ? "Ready ✓ — Waiting for Host to Start Quiz (Tap to Unready)"
-                          : "I'm Ready! (Tap so Host Can Start Quiz)"}
+                    {/* Host Name & Host Library Setup */}
+                    <div className="party-add-card">
+                      <span className="section-label">
+                        <Crown size={12} /> Your Host Name & Music Library
                       </span>
-                    </button>
+                      <div className="party-form-row">
+                        <input
+                          type="text"
+                          className="party-text-input"
+                          placeholder="Your Host Name (e.g. Thomas)"
+                          value={hostName}
+                          onChange={(e) => handleHostNameChange(e.target.value)}
+                        />
+                        <div className="provider-segmented">
+                          <button
+                            type="button"
+                            className={`seg-btn ${
+                              newPlayerProvider === 'youtube-music' ? 'active' : ''
+                            }`}
+                            onClick={() => setNewPlayerProvider('youtube-music')}
+                          >
+                            <Music2 size={13} />
+                            <span>YouTube</span>
+                          </button>
+                          <button
+                            type="button"
+                            className={`seg-btn ${newPlayerProvider === 'spotify' ? 'active' : ''}`}
+                            onClick={() => setNewPlayerProvider('spotify')}
+                          >
+                            <Sparkles size={13} />
+                            <span>Spotify</span>
+                          </button>
+                        </div>
+                      </div>
 
-                    {guestRoomState && guestRoomState.leaderboard.length > 0 && (
-                      <div className="member-list">
-                        {guestRoomState.leaderboard.map((m) => (
-                          <div key={m.memberId} className="member-row">
-                            <span
-                              className="member-dot"
-                              style={{ backgroundColor: m.color }}
-                            />
-                            <div className="member-info">
-                              <strong>
-                                {m.name} {m.isHost ? '(Host)' : ''}
-                              </strong>
-                              <span>{m.trackCount} songs</span>
-                            </div>
-                            <span className={`ready-pill ${m.isReady ? 'ready' : 'waiting'}`}>
-                              {m.isReady ? 'Ready ✓' : 'Waiting...'}
+                      <div className="party-btn-row">
+                        {selectedPartyProviderCachedCount > 0 && (
+                          <button
+                            type="button"
+                            className="btn-secondary"
+                            onClick={() => void handleAddHostOrLocalPlayer(true, true)}
+                          >
+                            <Check size={14} />
+                            <span>
+                              Use Saved as {hostName.trim() || 'Host'} (
+                              {selectedPartyProviderCachedCount})
                             </span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          disabled={isLoadingLibrary}
+                          onClick={() => void handleAddHostOrLocalPlayer(true, false)}
+                        >
+                          <UserPlus size={15} />
+                          <span>
+                            {isLoadingLibrary
+                              ? 'Syncing...'
+                              : `Connect ${
+                                  newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
+                                } as ${hostName.trim() || 'Host'}`}
+                          </span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Online Roster, Ready Gate & Start Button */}
+                    <div className="party-roster-card">
+                      <div className="roster-header">
+                        <span className="section-label">
+                          Online Room Roster ({partyMembers.length} Joined)
+                        </span>
+                        {partyMembers.length > 0 && (
+                          <button
+                            type="button"
+                            className="btn-chip danger"
+                            onClick={handleClearParty}
+                          >
+                            <Trash2 size={13} />
+                            <span>Reset Room</span>
+                          </button>
+                        )}
+                      </div>
+
+                      {partyMembers.length === 0 ? (
+                        <p className="party-empty-hint">
+                          Set your Host Name above and connect your library, then share the Room
+                          Code so remote players can join and mark Ready!
+                        </p>
+                      ) : (
+                        <>
+                          <div className="party-stats-pills">
+                            <div className="party-stat-box highlight">
+                              <span className="p-stat-num">
+                                {mergedPartyPool.sharedMatchesCount}
+                              </span>
+                              <span className="p-stat-label">Shared Matches</span>
+                            </div>
+                            <div className="party-stat-box">
+                              <span className="p-stat-num">{mergedPartyPool.totalUniqueCount}</span>
+                              <span className="p-stat-label">Total Unique Songs</span>
+                            </div>
                           </div>
-                        ))}
+
+                          <div className="member-list">
+                            {partyMembers.map((member) => (
+                              <div key={member.id} className="member-row">
+                                <span
+                                  className="member-dot"
+                                  style={{ backgroundColor: member.color }}
+                                />
+                                <div className="member-info">
+                                  <strong>
+                                    {member.name} {member.isHost ? '(Host)' : ''}
+                                  </strong>
+                                  <span>
+                                    {member.provider === 'youtube-music' ? 'YouTube' : 'Spotify'} ·{' '}
+                                    {member.tracks.length} songs
+                                  </span>
+                                </div>
+                                <button
+                                  type="button"
+                                  className={`ready-pill ${member.isReady ? 'ready' : 'waiting'}`}
+                                  onClick={() => handleHostToggleMemberReady(member.id)}
+                                  title="Click to toggle Ready status"
+                                >
+                                  {member.isReady ? 'Ready ✓' : 'Waiting...'}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="member-remove"
+                                  onClick={() => handleRemovePartyMember(member.id)}
+                                  aria-label={`Remove ${member.name}`}
+                                >
+                                  <X size={15} />
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+
+                          <button
+                            type="button"
+                            className="btn-primary btn-full-width"
+                            disabled={!allPartyMembersReady}
+                            onClick={() => {
+                              cancelCurrentGame();
+                              setIsPartyLobbyOpen(false);
+                              void startNewRound(mergedPartyPool.tracks, true);
+                            }}
+                          >
+                            <Play size={16} />
+                            <span>
+                              {!allPartyMembersReady
+                                ? `Waiting for ${unreadyPartyMembersCount} player${
+                                    unreadyPartyMembersCount > 1 ? 's' : ''
+                                  } to Ready Up...`
+                                : `Start Online Party Quiz (${mergedPartyPool.totalUniqueCount} Songs)`}
+                            </span>
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  /* Remote Guest Join & Ready Lobby Tab */
+                  <div className="party-join-panel">
+                    <p className="join-lead">
+                      Enter the host&apos;s 5-character Room Code, sync your library, and tap{' '}
+                      <strong>I&apos;m Ready</strong> so the host can start the quiz!
+                    </p>
+
+                    <div className="join-fields-stack">
+                      <div className="join-inputs-row">
+                        <input
+                          type="text"
+                          maxLength={6}
+                          className="party-text-input code-input"
+                          placeholder="CODE"
+                          value={joinRoomCode}
+                          onChange={(e) => handleJoinCodeChange(e.target.value)}
+                        />
+                        <input
+                          type="text"
+                          className="party-text-input"
+                          placeholder="Your Name"
+                          value={newPlayerName}
+                          onChange={(e) => handlePlayerNameChange(e.target.value)}
+                        />
+                      </div>
+
+                      <div className="provider-segmented full-width">
+                        <button
+                          type="button"
+                          className={`seg-btn ${
+                            newPlayerProvider === 'youtube-music' ? 'active' : ''
+                          }`}
+                          onClick={() => setNewPlayerProvider('youtube-music')}
+                        >
+                          <Music2 size={14} />
+                          <span>YouTube Music</span>
+                        </button>
+                        <button
+                          type="button"
+                          className={`seg-btn ${
+                            newPlayerProvider === 'spotify' ? 'active' : ''
+                          }`}
+                          onClick={() => setNewPlayerProvider('spotify')}
+                        >
+                          <Sparkles size={14} />
+                          <span>Spotify</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="party-btn-row">
+                      {selectedPartyProviderCachedCount > 0 && (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          disabled={isLoadingLibrary}
+                          onClick={() => void handleGuestJoinAndSend(true)}
+                        >
+                          <Send size={15} />
+                          <span>Send Saved ({selectedPartyProviderCachedCount} songs)</span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        disabled={isLoadingLibrary}
+                        onClick={() => void handleGuestJoinAndSend(false)}
+                      >
+                        <Send size={15} />
+                        <span>
+                          {isLoadingLibrary
+                            ? 'Connecting & Sending...'
+                            : `Sign In & Join (${
+                                newPlayerProvider === 'youtube-music' ? 'YouTube' : 'Spotify'
+                              })`}
+                        </span>
+                      </button>
+                    </div>
+
+                    {(guestAck || guestRoomState) && (
+                      <div className="guest-ready-card">
+                        <div className="guest-ack-banner">
+                          <CheckCircle2 size={18} />
+                          <span>
+                            Connected to Room{' '}
+                            <strong>{guestRoomState?.roomCode ?? guestAck?.roomCode}</strong>
+                            {guestRoomState ? (
+                              <>
+                                {' '}
+                                (Host: <strong>{guestRoomState.hostName}</strong> ·{' '}
+                                <strong>{guestRoomState.totalTracksCount} songs</strong>)
+                              </>
+                            ) : null}
+                          </span>
+                        </div>
+
+                        <button
+                          type="button"
+                          className={`btn-ready-toggle ${guestIsReady ? 'is-ready' : ''}`}
+                          onClick={handleToggleGuestReady}
+                        >
+                          <UserCheck size={18} />
+                          <span>
+                            {guestIsReady
+                              ? 'Ready ✓ — Waiting for Host to Start Quiz (Tap to Unready)'
+                              : "I'm Ready! (Tap so Host Can Start Quiz)"}
+                          </span>
+                        </button>
+
+                        {guestRoomState && guestRoomState.leaderboard.length > 0 && (
+                          <div className="member-list">
+                            {guestRoomState.leaderboard.map((m) => (
+                              <div key={m.memberId} className="member-row">
+                                <span
+                                  className="member-dot"
+                                  style={{ backgroundColor: m.color }}
+                                />
+                                <div className="member-info">
+                                  <strong>
+                                    {m.name} {m.isHost ? '(Host)' : ''}
+                                  </strong>
+                                  <span>{m.trackCount} songs</span>
+                                </div>
+                                <span className={`ready-pill ${m.isReady ? 'ready' : 'waiting'}`}>
+                                  {m.isReady ? 'Ready ✓' : 'Waiting...'}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
                 )}
-              </div>
+              </>
             )}
           </section>
-        ) : catalog.length === 0 ? (
+        ) : !isRemoteGuestPlaying && catalog.length === 0 ? (
           /* 2. SIMPLIFIED SOLO ONBOARDING VIEW */
           <section className="surface-card onboarding-view">
             <div className="hero-badge">
@@ -2557,8 +2455,8 @@ export function App() {
             </div>
             <h2>Guess your own Liked Songs from 0.1s</h2>
             <p className="onboarding-lead">
-              Unlock longer audio clips if you need a hint—the faster you identify the track, the
-              higher your score.
+              Unlock longer audio clips if you need a hint—points only decrease when you unlock
+              more of the song, never over time.
             </p>
 
             <div className="cta-stack">
@@ -2601,7 +2499,7 @@ export function App() {
               )}
             </div>
           </section>
-        ) : view === 'summary' ? (
+        ) : !isRemoteGuestPlaying && view === 'summary' ? (
           /* 3. SUMMARY / END-OF-RUN RANKING VIEW */
           <section className="surface-card summary-view">
             <div className="summary-hero">
@@ -2632,7 +2530,7 @@ export function App() {
                 <span className="tile-value">{ranking.winRatePercent}%</span>
               </div>
               <div className="stat-tile">
-                <span className="tile-label">Avg Time</span>
+                <span className="tile-label">Avg Clip</span>
                 <span className="tile-value">{ranking.averageDurationSec}s</span>
               </div>
             </div>
@@ -2669,11 +2567,7 @@ export function App() {
                       )}
                     </div>
                     <div className="history-badges">
-                      <span className="tag-duration">
-                        {item.guessElapsedSec
-                          ? `${item.guessElapsedSec.toFixed(1)}s`
-                          : `${item.unlockedDurationSec.toFixed(1)}s`}
-                      </span>
+                      <span className="tag-duration">{item.unlockedDurationSec.toFixed(1)}s</span>
                       <span className={`tag-points ${item.status}`}>
                         {item.status === 'won'
                           ? `+${item.pointsAwarded.toLocaleString()}`
@@ -2696,27 +2590,55 @@ export function App() {
             </div>
           </section>
         ) : (
-          /* 4. ACTIVE QUIZ VIEW (Solo & Party Host) */
+          /* ==================================================================
+             4. UNIFIED ACTIVE QUIZ STAGE (Solo, Local Party, Online Host, AND Remote Guest!)
+             Every player has their own Music Player & controls snippet length!
+             ================================================================== */
           <section
             className={`surface-card quiz-stage ${
               roundState !== 'playing' ? `result-focused ${roundState}` : ''
             }`}
           >
             <ConfettiCanvas
-              active={roundState === 'won' || (isPartyMode && hostRoundStatus === 'correct')}
+              active={roundState === 'won' || activeOnlineStatus === 'correct'}
             />
 
             {isPartyMode && (
               <div className="party-active-bar">
                 <div className="party-roster-chips">
-                  <span className="party-bar-label">
-                    <Users size={13} /> Room <strong>{hostRoomCode}</strong> ·{' '}
-                    {mergedPartyPool.sharedMatchesCount} shared · {mergedPartyPool.totalUniqueCount}{' '}
-                    songs
-                  </span>
+                  {isRemoteGuestPlaying && guestRoomState ? (
+                    <span className="party-bar-label">
+                      <Globe size={13} /> Online Room <strong>{guestRoomState.roomCode}</strong> ·
+                      Host: <strong>{guestRoomState.hostName}</strong>
+                    </span>
+                  ) : partyLocationMode === 'remote' ? (
+                    <span className="party-bar-label">
+                      <Globe size={13} /> Online Room <strong>{hostRoomCode}</strong> ·{' '}
+                      {mergedPartyPool.sharedMatchesCount} shared ·{' '}
+                      {mergedPartyPool.totalUniqueCount} songs
+                    </span>
+                  ) : (
+                    <>
+                      <span className="party-bar-label">
+                        <Home size={13} /> Local Party ({mergedPartyPool.sharedMatchesCount} shared
+                        · {mergedPartyPool.totalUniqueCount} songs):
+                      </span>
+                      {partyMembers.map((m) => (
+                        <span
+                          key={m.id}
+                          className="fav-mini-pill"
+                          style={{ borderColor: m.color }}
+                        >
+                          <i style={{ backgroundColor: m.color }} />
+                          {m.name}
+                        </span>
+                      ))}
+                    </>
+                  )}
                 </div>
+
                 <div className="party-bar-actions">
-                  {roundState === 'playing' && (
+                  {isOnlinePartyHost && roundState === 'playing' && (
                     <button
                       type="button"
                       className="btn-party-lobby-link"
@@ -2729,11 +2651,17 @@ export function App() {
                     type="button"
                     className="btn-party-lobby-link"
                     onClick={() => {
-                      cancelCurrentGame();
-                      setIsPartyLobbyOpen(true);
+                      if (isRemoteGuestPlaying) {
+                        stopAllPlayback();
+                        setGuestRoomState(null);
+                        setGuestAck(null);
+                      } else {
+                        cancelCurrentGame();
+                        setIsPartyLobbyOpen(true);
+                      }
                     }}
                   >
-                    Lobby
+                    {isRemoteGuestPlaying ? 'Leave Room' : 'Lobby'}
                   </button>
                 </div>
               </div>
@@ -2741,7 +2669,7 @@ export function App() {
 
             {roundState === 'playing' ? (
               <>
-                {/* Compact Status Header with Live Timestamp */}
+                {/* Status Header: Points do NOT count down with time — only change with unlocked clip length */}
                 <div className="stage-header">
                   <div className="potential-score-box">
                     <span className="stage-eyebrow">Points at Stake</span>
@@ -2757,16 +2685,16 @@ export function App() {
                   </div>
 
                   <div className="snippet-length-box">
-                    <span className="stage-eyebrow">Elapsed / Clip</span>
+                    <span className="stage-eyebrow">Your Clip Length</span>
                     <div className="length-display-row">
                       <Ear size={16} className="ear-icon" />
                       <span className="length-value">{snippetDurationSec.toFixed(1)}s</span>
-                      <span className="length-max">· {liveRoundTimerSec.toFixed(1)}s</span>
+                      <span className="length-max">/ 30s</span>
                     </div>
                   </div>
                 </div>
 
-                {/* Compact Mobile-Friendly Player Deck */}
+                {/* Every Player's Own Music Player & Snippet Duration Controls */}
                 <div className={`player-deck ${isPlaying ? 'is-playing' : ''}`}>
                   <div className="player-top-row">
                     <button
@@ -2792,7 +2720,7 @@ export function App() {
                               {playbackElapsedSec.toFixed(1)}s / {snippetDurationSec.toFixed(1)}s
                             </>
                           ) : (
-                            <>Slide or tap a milestone below</>
+                            <>Choose how long to play (0.1s – 30s)</>
                           )}
                         </span>
                         <span className="curve-hint">
@@ -2848,13 +2776,28 @@ export function App() {
                   </div>
                 </div>
 
-                {/* Search & Guess Input */}
-                {isPartyMode && hostRoundStatus === 'correct' ? (
+                {/* Search & Guess Input (or Locked-In Banner in Online Party Mode) */}
+                {(isOnlinePartyHost || isRemoteGuestPlaying) &&
+                activeOnlineStatus === 'correct' ? (
                   <div className="guest-locked-banner correct">
                     <CheckCircle2 size={20} />
                     <div>
-                      <strong>You locked in the correct song!</strong>
-                      <span>Waiting for other party players to finish guessing...</span>
+                      <strong>
+                        Correct at {effectiveScoringDuration.toFixed(1)}s clip!
+                      </strong>
+                      <span>
+                        +{potentialNetPoints.toLocaleString()} pts locked in · Waiting for other
+                        players...
+                      </span>
+                    </div>
+                  </div>
+                ) : (isOnlinePartyHost || isRemoteGuestPlaying) &&
+                  activeOnlineStatus === 'gave-up' ? (
+                  <div className="guest-locked-banner skipped">
+                    <Flag size={18} />
+                    <div>
+                      <strong>Round Skipped</strong>
+                      <span>Waiting for other players to finish guessing...</span>
                     </div>
                   </div>
                 ) : (
@@ -2866,7 +2809,7 @@ export function App() {
                           ref={searchInputRef}
                           type="text"
                           className="search-input"
-                          placeholder={`Search ${catalog.length} songs...`}
+                          placeholder={`Search ${searchablePool.length} songs...`}
                           value={searchQuery}
                           onFocus={() => setIsDropdownOpen(true)}
                           onChange={(e) => {
@@ -2968,13 +2911,7 @@ export function App() {
                     {roundState === 'won' ? (
                       <span className="spotlight-status won">
                         <CheckCircle2 size={16} />
-                        <span>
-                          Got it in{' '}
-                          {roundHistory[roundHistory.length - 1]?.guessElapsedSec
-                            ? `${roundHistory[roundHistory.length - 1].guessElapsedSec?.toFixed(1)}s`
-                            : `${effectiveScoringDuration.toFixed(1)}s clip`}
-                          !
-                        </span>
+                        <span>Identified at {effectiveScoringDuration.toFixed(1)}s clip!</span>
                       </span>
                     ) : (
                       <span className="spotlight-status gave-up">
@@ -2985,9 +2922,11 @@ export function App() {
 
                     <span className="spotlight-points-award">
                       +
-                      {(
-                        roundHistory[roundHistory.length - 1]?.pointsAwarded ?? 0
-                      ).toLocaleString()}{' '}
+                      {isRemoteGuestPlaying
+                        ? (guestMyEntry?.roundPoints ?? 0).toLocaleString()
+                        : (
+                            roundHistory[roundHistory.length - 1]?.pointsAwarded ?? 0
+                          ).toLocaleString()}{' '}
                       pts
                     </span>
                   </div>
@@ -3072,38 +3011,40 @@ export function App() {
                     </div>
                   </div>
 
-                  <div className="spotlight-actions">
-                    <button
-                      type="button"
-                      className="btn-secondary"
-                      onClick={() => setView('summary')}
-                    >
-                      <Trophy size={15} />
-                      <span>Run Summary</span>
-                    </button>
-                    <button
-                      type="button"
-                      autoFocus
-                      className="btn-primary btn-next-song-lg"
-                      onClick={() => void startNewRound()}
-                    >
-                      <span>Next Song</span>
-                      <ArrowRight size={17} />
-                    </button>
-                  </div>
+                  {!isRemoteGuestPlaying && (
+                    <div className="spotlight-actions">
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => setView('summary')}
+                      >
+                        <Trophy size={15} />
+                        <span>Run Summary</span>
+                      </button>
+                      <button
+                        type="button"
+                        autoFocus
+                        className="btn-primary btn-next-song-lg"
+                        onClick={() => void startNewRound()}
+                      >
+                        <span>Next Song</span>
+                        <ArrowRight size={17} />
+                      </button>
+                    </div>
+                  )}
                 </div>
               )
             )}
 
-            {/* Party Mode Live Timestamp Scoreboard on Host */}
-            {isPartyMode && partyLeaderboard.length > 0 && (
+            {/* Online Party Standings & Unlocked Clip Timestamps */}
+            {(isOnlinePartyHost || isRemoteGuestPlaying) && activeLeaderboard.length > 0 && (
               <div className="party-live-board">
                 <div className="attempts-header">
-                  <span>Party Standings & Guess Timestamps</span>
-                  <span>Ranked by Score & Speed</span>
+                  <span>Online Party Standings</span>
+                  <span>Scored by Unlocked Clip Length</span>
                 </div>
                 <div className="member-list">
-                  {partyLeaderboard.map((entry, idx) => (
+                  {activeLeaderboard.map((entry, idx) => (
                     <div key={entry.memberId} className="member-row">
                       <span className="rank-num">#{idx + 1}</span>
                       <span
@@ -3116,7 +3057,7 @@ export function App() {
                         </strong>
                         <span>
                           {entry.roundStatus === 'correct'
-                            ? `✓ ${entry.guessElapsedSec?.toFixed(2)}s (+${entry.roundPoints.toLocaleString()})`
+                            ? `✓ @${entry.guessSnippetSec?.toFixed(1)}s clip (+${entry.roundPoints.toLocaleString()})`
                             : entry.roundStatus === 'gave-up'
                               ? 'Skipped'
                               : entry.wrongAttempts > 0
@@ -3137,7 +3078,7 @@ export function App() {
             {guesses.length > 0 && (
               <div className="attempts-section">
                 <div className="attempts-header">
-                  <span>Attempts ({guesses.length})</span>
+                  <span>Your Attempts ({guesses.length})</span>
                   <span>−{WRONG_GUESS_PENALTY} pts / wrong</span>
                 </div>
                 <div className="attempts-list">
@@ -3152,7 +3093,7 @@ export function App() {
                         <span>{g.artist}</span>
                       </div>
                       <span className="attempt-badge">
-                        @{g.guessElapsedSec ? `${g.guessElapsedSec.toFixed(1)}s` : `${g.snippetDurationAtGuessSec.toFixed(1)}s`}
+                        @{g.snippetDurationAtGuessSec.toFixed(1)}s
                       </span>
                     </div>
                   ))}

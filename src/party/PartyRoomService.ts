@@ -1,5 +1,5 @@
 import Peer, { DataConnection } from 'peerjs';
-import { PartyMemberRef, ProviderId, Track } from '../providers/types';
+import { ProviderId, Track } from '../providers/types';
 
 const PEER_PREFIX = 'aurelia-party-v1-';
 const MQTT_TOPIC_ROOT = 'aurelia/party/v3';
@@ -99,16 +99,11 @@ export interface PartyRoomStatePayload {
   totalTracksCount: number;
   roundNumber: number;
   roundStartedAtMs: number;
+  startOffsetSec: number;
   snippetDurationSec: number;
   maxUnlockedDurationSec: number;
   isPlayingAudio: boolean;
-  currentTrack: {
-    id: string;
-    title: string;
-    artist: string;
-    artworkUrl?: string;
-    favoritedBy?: PartyMemberRef[];
-  } | null;
+  currentTrack: Track | null;
   leaderboard: PartyLeaderboardEntry[];
 }
 

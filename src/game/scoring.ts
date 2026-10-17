@@ -55,18 +55,16 @@ export function calculateLogarithmicBaseScore(durationSec: number): number {
 }
 
 /**
- * Computes the net round points after deducting -500 pts per wrong guess
- * and factoring in optional guess timestamp elapsed seconds.
+ * Computes the net round points from the unlocked snippet duration (0.1s - 30s)
+ * after deducting -500 pts per wrong guess. Points do not count down with time.
  */
 export function calculateNetRoundScore(
   durationSec: number,
-  wrongGuessesCount: number,
-  elapsedSec = 0
+  wrongGuessesCount: number
 ): number {
   const base = calculateLogarithmicBaseScore(durationSec);
-  const timeDecay = Math.min(3000, Math.max(0, Math.round(elapsedSec * 85)));
   const penalty = Math.max(0, wrongGuessesCount) * WRONG_GUESS_PENALTY;
-  return Math.max(250, base - timeDecay - penalty);
+  return Math.max(0, base - penalty);
 }
 
 /**
