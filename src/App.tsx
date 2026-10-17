@@ -10,7 +10,6 @@ import {
   LogOut,
   Music2,
   Play,
-  Plus,
   RefreshCw,
   RotateCcw,
   Search,
@@ -866,27 +865,6 @@ export function App() {
                   </div>
                 </div>
               </div>
-
-              {/* Quick Add Time Actions */}
-              {roundState === 'playing' && (
-                <div className="extend-actions-bar">
-                  <span className="extend-label">Need more time?</span>
-                  <div className="extend-buttons">
-                    {[0.5, 1, 2, 5].map((addSec) => (
-                      <button
-                        key={addSec}
-                        type="button"
-                        className="btn-extend"
-                        disabled={snippetDurationSec >= MAX_SNIPPET_SECONDS}
-                        onClick={() => handleScrubberChange(snippetDurationSec + addSec, true)}
-                      >
-                        <Plus size={13} />
-                        <span>{addSec}s & Play</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
             </div>
 
             {/* Search & Guess Input OR Round Reveal Card */}
