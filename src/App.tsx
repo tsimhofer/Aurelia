@@ -126,8 +126,9 @@ export function App() {
     setErrorMessage(null);
   };
 
-  // Sync catalog when switching provider
+  // Sync catalog and theme attribute when switching provider
   useEffect(() => {
+    document.documentElement.setAttribute('data-provider', activeProviderId);
     activeProvider.stopPlayback();
     setIsPlaying(false);
     const cached = activeProvider.getCachedCatalog();
@@ -406,15 +407,20 @@ export function App() {
     : unlockedPercent;
 
   return (
-    <div className="app-shell">
-      {/* Minimal, Intuitive Header */}
+    <div className="app-shell" data-provider={activeProviderId}>
+      {/* Brutalist Header */}
       <header className="top-nav">
         <div className="brand-cluster">
           <div className="brand">
             <div className="brand-icon">
               <Disc3 className={isPlaying ? 'spin-slow' : ''} size={22} />
             </div>
-            <span className="brand-title">Aurelia</span>
+            <div className="brand-title-stack">
+              <span className="brand-title">AURELIA</span>
+              <span className="brand-mode-tag">
+                {activeProviderId === 'youtube-music' ? 'MODE // YT_MUSIC' : 'MODE // SPOTIFY'}
+              </span>
+            </div>
           </div>
 
           <div className="provider-segmented" role="tablist" aria-label="Music Source">
