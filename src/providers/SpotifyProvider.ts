@@ -354,14 +354,21 @@ export class SpotifyProvider implements MusicProvider {
 
     for (let page = 0; page < maxPages; page++) {
       const offset = page * limit;
-      const response = await fetch(
-        `https://api.spotify.com/v1/me/tracks?limit=${limit}&offset=${offset}`,
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        }
-      );
+      let response: Response;
+      try {
+        response = await fetch(
+          `https://api.spotify.com/v1/me/tracks?limit=${limit}&offset=${offset}`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          }
+        );
+      } catch (err) {
+        if (collected.length > 0) break;
+        if (this.catalog.length > 0) return this.catalog;
+        throw err;
+      }
 
       if (response.status === 401) {
         this.accessToken = null;
@@ -370,6 +377,7 @@ export class SpotifyProvider implements MusicProvider {
       }
 
       if (!response.ok) {
+        if (collected.length > 0) break;
         const errText = await response.text();
         throw new Error(`Spotify API error (${response.status}): ${errText}`);
       }

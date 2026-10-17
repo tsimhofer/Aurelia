@@ -271,23 +271,36 @@ export class YouTubeMusicProvider implements MusicProvider {
         params.set('pageToken', pageToken);
       }
 
-      const response = await fetch(
-        `https://www.googleapis.com/youtube/v3/playlistItems?${params.toString()}`,
-        {
-          headers: {
-            Authorization: `Bearer ${this.accessToken}`,
-            Accept: 'application/json',
-          },
-        }
-      );
+      let response: Response;
+      try {
+        response = await fetch(
+          `https://www.googleapis.com/youtube/v3/playlistItems?${params.toString()}`,
+          {
+            headers: {
+              Authorization: `Bearer ${this.accessToken}`,
+              Accept: 'application/json',
+            },
+          }
+        );
+      } catch (err) {
+        if (collected.length > 0) break;
+        if (this.catalog.length > 0) return this.catalog;
+        throw err;
+      }
 
       if (response.status === 401) {
         this.accessToken = null;
         sessionStorage.removeItem(STORAGE_KEY_TOKEN);
+        if (page === 0) {
+          await this.authenticate();
+          page--;
+          continue;
+        }
         throw new Error('YouTube OAuth token expired. Please reconnect your account.');
       }
 
       if (!response.ok) {
+        if (collected.length > 0) break;
         const errBody = await response.text();
         throw new Error(`YouTube Data API error (${response.status}): ${errBody}`);
       }
