@@ -408,19 +408,14 @@ export function App() {
 
   return (
     <div className="app-shell" data-provider={activeProviderId}>
-      {/* Brutalist Header */}
+      {/* Header */}
       <header className="top-nav">
         <div className="brand-cluster">
           <div className="brand">
             <div className="brand-icon">
-              <Disc3 className={isPlaying ? 'spin-slow' : ''} size={22} />
+              <Disc3 className={isPlaying ? 'spin-slow' : ''} size={21} />
             </div>
-            <div className="brand-title-stack">
-              <span className="brand-title">AURELIA</span>
-              <span className="brand-mode-tag">
-                {activeProviderId === 'youtube-music' ? 'MODE // YT_MUSIC' : 'MODE // SPOTIFY'}
-              </span>
-            </div>
+            <span className="brand-title">Aurelia</span>
           </div>
 
           <div className="provider-segmented" role="tablist" aria-label="Music Source">
