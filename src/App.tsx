@@ -63,6 +63,7 @@ type OffsetMode = 'zero' | 'random';
 const MILESTONE_SECONDS = [0.1, 0.5, 1, 2, 5, 10, 15, 30];
 const STORAGE_KEY_PARTY_MEMBERS = 'aurelia.party.members.v1';
 const STORAGE_KEY_PENDING_PARTY_ACTION = 'aurelia.party.pending_action.v1';
+const STORAGE_KEY_GAME_SESSION = 'aurelia.game.session.v1';
 
 interface PendingPartyAction {
   mode: 'local-add' | 'remote-join';
@@ -71,8 +72,37 @@ interface PendingPartyAction {
   roomCode?: string;
 }
 
+interface PersistedGameSession {
+  view: ScreenView;
+  offsetMode: OffsetMode;
+  currentTrack: Track | null;
+  startOffsetSec: number;
+  snippetDurationSec: number;
+  maxUnlockedDurationSec: number;
+  guesses: RoundGuess[];
+  roundState: 'playing' | 'won' | 'gave-up';
+  roundHistory: CompletedRound[];
+  usedTrackIds: string[];
+  memberPickCounts: Record<string, number>;
+}
+
+function loadSavedGameSession(): PersistedGameSession | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_GAME_SESSION);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PersistedGameSession;
+    if (parsed && typeof parsed === 'object') {
+      return parsed;
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return null;
+}
+
 export function App() {
   const env = useMemo(() => getEnvConfig(), []);
+  const savedSession = useMemo(() => loadSavedGameSession(), []);
   const ytProviderRef = useRef<YouTubeMusicProvider | null>(null);
   const spotifyProviderRef = useRef<SpotifyProvider | null>(null);
   const partyRoomRef = useRef<PartyRoomService | null>(null);
@@ -131,7 +161,9 @@ export function App() {
     }
     return [];
   });
-  const [memberPickCounts, setMemberPickCounts] = useState<Record<string, number>>({});
+  const [memberPickCounts, setMemberPickCounts] = useState<Record<string, number>>(
+    () => savedSession?.memberPickCounts ?? {}
+  );
   const [isPartyModalOpen, setIsPartyModalOpen] = useState<boolean>(() => {
     const params = new URLSearchParams(window.location.search);
     return params.has('party');
@@ -170,20 +202,70 @@ export function App() {
   const isPartyActive = partyMembers.length > 0;
   const catalog = isPartyActive ? mergedPartyPool.tracks : soloCatalog;
 
-  // Game & Round State
-  const [view, setView] = useState<ScreenView>('quiz');
-  const [offsetMode, setOffsetMode] = useState<OffsetMode>('zero');
-  const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
-  const [startOffsetSec, setStartOffsetSec] = useState<number>(0);
-  const [snippetDurationSec, setSnippetDurationSec] = useState<number>(MIN_SNIPPET_SECONDS);
-  const [maxUnlockedDurationSec, setMaxUnlockedDurationSec] = useState<number>(MIN_SNIPPET_SECONDS);
+  // Game & Round State (Restored from savedSession on page refresh)
+  const [view, setView] = useState<ScreenView>(() => savedSession?.view ?? 'quiz');
+  const [offsetMode, setOffsetMode] = useState<OffsetMode>(
+    () => savedSession?.offsetMode ?? 'zero'
+  );
+  const [currentTrack, setCurrentTrack] = useState<Track | null>(
+    () => savedSession?.currentTrack ?? null
+  );
+  const [startOffsetSec, setStartOffsetSec] = useState<number>(
+    () => savedSession?.startOffsetSec ?? 0
+  );
+  const [snippetDurationSec, setSnippetDurationSec] = useState<number>(
+    () => savedSession?.snippetDurationSec ?? MIN_SNIPPET_SECONDS
+  );
+  const [maxUnlockedDurationSec, setMaxUnlockedDurationSec] = useState<number>(
+    () => savedSession?.maxUnlockedDurationSec ?? MIN_SNIPPET_SECONDS
+  );
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [playbackElapsedSec, setPlaybackElapsedSec] = useState<number>(0);
 
-  const [guesses, setGuesses] = useState<RoundGuess[]>([]);
-  const [roundState, setRoundState] = useState<'playing' | 'won' | 'gave-up'>('playing');
-  const [roundHistory, setRoundHistory] = useState<CompletedRound[]>([]);
-  const [usedTrackIds, setUsedTrackIds] = useState<Set<string>>(() => new Set());
+  const [guesses, setGuesses] = useState<RoundGuess[]>(() => savedSession?.guesses ?? []);
+  const [roundState, setRoundState] = useState<'playing' | 'won' | 'gave-up'>(
+    () => savedSession?.roundState ?? 'playing'
+  );
+  const [roundHistory, setRoundHistory] = useState<CompletedRound[]>(
+    () => savedSession?.roundHistory ?? []
+  );
+  const [usedTrackIds, setUsedTrackIds] = useState<Set<string>>(
+    () => new Set(savedSession?.usedTrackIds ?? [])
+  );
+
+  // Persist active game session whenever round/game state updates
+  useEffect(() => {
+    try {
+      const payload: PersistedGameSession = {
+        view,
+        offsetMode,
+        currentTrack,
+        startOffsetSec,
+        snippetDurationSec,
+        maxUnlockedDurationSec,
+        guesses,
+        roundState,
+        roundHistory,
+        usedTrackIds: Array.from(usedTrackIds),
+        memberPickCounts,
+      };
+      localStorage.setItem(STORAGE_KEY_GAME_SESSION, JSON.stringify(payload));
+    } catch {
+      // Ignore storage errors
+    }
+  }, [
+    view,
+    offsetMode,
+    currentTrack,
+    startOffsetSec,
+    snippetDurationSec,
+    maxUnlockedDurationSec,
+    guesses,
+    roundState,
+    roundHistory,
+    usedTrackIds,
+    memberPickCounts,
+  ]);
 
   // Autocomplete State
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -198,6 +280,17 @@ export function App() {
     return spotifyProviderRef.current!;
   };
 
+  // Pre-cue restored currentTrack on mount so pressing Play after a refresh works immediately
+  useEffect(() => {
+    if (savedSession?.currentTrack) {
+      const provider = getPlaybackProviderForTrack(savedSession.currentTrack);
+      void provider.cueTrack(savedSession.currentTrack).catch(() => {
+        // Ignore cue errors on background restore
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const stopAllPlayback = () => {
     ytProviderRef.current?.stopPlayback();
     spotifyProviderRef.current?.stopPlayback();
@@ -205,9 +298,13 @@ export function App() {
   };
 
   const switchProvider = (nextProviderId: ProviderId) => {
+    if (nextProviderId === activeProviderId) return;
     stopAllPlayback();
     setErrorMessage(null);
     setActiveProviderId(nextProviderId);
+    if (!isPartyActive) {
+      setCurrentTrack(null);
+    }
     try {
       localStorage.setItem(STORAGE_KEY_ACTIVE_PROVIDER, nextProviderId);
     } catch {
@@ -224,13 +321,8 @@ export function App() {
   // Sync solo catalog and theme attribute when switching provider
   useEffect(() => {
     document.documentElement.setAttribute('data-provider', activeProviderId);
-    stopAllPlayback();
     const cached = activeProvider.getCachedCatalog();
     setSoloCatalog(cached);
-    if (!isPartyActive) {
-      setCurrentTrack(null);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProvider, activeProviderId]);
 
   const addOrUpdatePartyMember = (
