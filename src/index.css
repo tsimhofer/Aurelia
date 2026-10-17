@@ -105,6 +105,7 @@ body {
 }
 
 .badge-primary,
+.badge-spotify,
 .badge-staged {
   font-size: 0.65rem;
   padding: 0.1rem 0.35rem;
@@ -118,9 +119,40 @@ body {
   color: #c4b5fd;
 }
 
+.badge-spotify {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+}
+
 .badge-staged {
   background: rgba(148, 163, 184, 0.15);
   color: var(--text-secondary);
+}
+
+.strategy-selector-box {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  padding: 0.9rem 1.1rem;
+  margin-bottom: 1.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+}
+
+.strategy-label-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.strategy-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 
 .score-pill-group {

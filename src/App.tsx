@@ -8,6 +8,7 @@ import {
   LogOut,
   Music2,
   Play,
+  Radio,
   RefreshCw,
   RotateCcw,
   Search,
@@ -28,7 +29,11 @@ import {
   RoundGuess,
   WRONG_GUESS_PENALTY,
 } from './game/scoring';
-import { SpotifyProvider } from './providers/SpotifyProvider';
+import {
+  SpotifyPlaybackStrategy,
+  SpotifyProvider,
+  STORAGE_KEY_ACTIVE_PROVIDER,
+} from './providers/SpotifyProvider';
 import { MusicProvider, ProviderId, Track } from './providers/types';
 import { YouTubeMusicProvider } from './providers/YouTubeMusicProvider';
 
@@ -47,7 +52,26 @@ export function App() {
     spotifyProviderRef.current = new SpotifyProvider(ytProviderRef.current);
   }
 
-  const [activeProviderId, setActiveProviderId] = useState<ProviderId>('youtube-music');
+  const [activeProviderId, setActiveProviderId] = useState<ProviderId>(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.has('code') || params.has('error')) {
+        return 'spotify';
+      }
+      const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_PROVIDER);
+      if (saved === 'spotify' || saved === 'youtube-music') {
+        return saved;
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    return 'youtube-music';
+  });
+
+  const [spotifyStrategy, setSpotifyStrategy] = useState<SpotifyPlaybackStrategy>(() =>
+    spotifyProviderRef.current!.getPlaybackStrategy()
+  );
+
   const activeProvider: MusicProvider =
     activeProviderId === 'youtube-music' ? ytProviderRef.current : spotifyProviderRef.current;
 
@@ -75,15 +99,74 @@ export function App() {
   const [selectedSuggestionIdx, setSelectedSuggestionIdx] = useState<number>(0);
   const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
 
+  const switchProvider = (nextProviderId: ProviderId) => {
+    activeProvider.stopPlayback();
+    setIsPlaying(false);
+    setErrorMessage(null);
+    setActiveProviderId(nextProviderId);
+    try {
+      localStorage.setItem(STORAGE_KEY_ACTIVE_PROVIDER, nextProviderId);
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleSpotifyStrategyChange = (nextStrategy: SpotifyPlaybackStrategy) => {
+    spotifyProviderRef.current?.setPlaybackStrategy(nextStrategy);
+    setSpotifyStrategy(nextStrategy);
+    setErrorMessage(null);
+  };
+
   // Sync catalog when switching provider
   useEffect(() => {
     activeProvider.stopPlayback();
     setIsPlaying(false);
-    setErrorMessage(null);
     const cached = activeProvider.getCachedCatalog();
     setCatalog(cached);
     setCurrentTrack(null);
   }, [activeProvider, activeProviderId]);
+
+  // Handle Spotify PKCE OAuth redirect callback (?code=...) on mount
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const authError = params.get('error');
+
+    if (!code && !authError) {
+      return;
+    }
+
+    // Clean query params from address bar
+    const cleanUrl = window.location.origin + window.location.pathname + window.location.hash;
+    window.history.replaceState({}, document.title, cleanUrl);
+
+    if (authError) {
+      setErrorMessage(`Spotify authorization failed: ${authError}`);
+      return;
+    }
+
+    if (code && spotifyProviderRef.current) {
+      setIsLoadingLibrary(true);
+      setErrorMessage(null);
+      void spotifyProviderRef.current
+        .handleRedirectCallback(code)
+        .then(() => spotifyProviderRef.current!.fetchLikedTracks(true))
+        .then((tracks) => {
+          setCatalog(tracks);
+          if (tracks.length === 0) {
+            setErrorMessage('Connected to Spotify, but no Liked Songs were found in your library.');
+          }
+        })
+        .catch((err) => {
+          setErrorMessage(
+            err instanceof Error ? err.message : 'Spotify authentication exchange failed.'
+          );
+        })
+        .finally(() => {
+          setIsLoadingLibrary(false);
+        });
+    }
+  }, []);
 
   const wrongGuessesCount = useMemo(
     () => guesses.filter((g) => !g.correct).length,
@@ -146,7 +229,9 @@ export function App() {
       const tracks = await activeProvider.fetchLikedTracks(forceRefresh);
       setCatalog(tracks);
       if (tracks.length === 0) {
-        setErrorMessage('Connected successfully, but no liked songs were returned from your library.');
+        setErrorMessage(
+          'Connected successfully, but no liked songs were returned from your library.'
+        );
       } else {
         await startNewRound(tracks);
       }
@@ -317,7 +402,7 @@ export function App() {
           <button
             type="button"
             className={`provider-tab ${activeProviderId === 'youtube-music' ? 'active' : ''}`}
-            onClick={() => setActiveProviderId('youtube-music')}
+            onClick={() => switchProvider('youtube-music')}
           >
             <Music2 size={15} />
             <span>YouTube Music</span>
@@ -326,11 +411,13 @@ export function App() {
           <button
             type="button"
             className={`provider-tab ${activeProviderId === 'spotify' ? 'active' : ''}`}
-            onClick={() => setActiveProviderId('spotify')}
+            onClick={() => switchProvider('spotify')}
           >
             <Sparkles size={15} />
             <span>Spotify</span>
-            <span className="badge-staged">Staged</span>
+            <span className={env.spotify.isConfigured ? 'badge-spotify' : 'badge-staged'}>
+              {env.spotify.isConfigured ? 'Ready' : 'Setup'}
+            </span>
           </button>
         </div>
 
@@ -364,12 +451,12 @@ export function App() {
               <strong>
                 {activeProviderId === 'youtube-music'
                   ? 'Google Cloud OAuth & YouTube Data API v3 Credentials Required'
-                  : 'Spotify PKCE Client Configuration Staged'}
+                  : 'Spotify Developer Client ID Required (PKCE OAuth 2.0)'}
               </strong>
               <p>
                 {activeProviderId === 'youtube-music'
-                  ? 'Populate VITE_GOOGLE_CLIENT_ID and VITE_GOOGLE_API_KEY in .env.local (or GitHub Actions repository secrets) to authenticate and fetch your Liked Music (playlistId=LM).'
-                  : 'Spotify is modularly scaffolded for future activation via VITE_SPOTIFY_CLIENT_ID and VITE_SPOTIFY_REDIRECT_URI.'}
+                  ? 'Populate VITE_GOOGLE_CLIENT_ID and VITE_GOOGLE_API_KEY in .env.local (or GitHub Actions repository variables) to fetch your Liked Music (playlistId=LM).'
+                  : `Populate VITE_SPOTIFY_CLIENT_ID and VITE_SPOTIFY_REDIRECT_URI (default: ${env.spotify.redirectUri}) in .env.local to authenticate via PKCE and fetch your Spotify Liked Songs (/v1/me/tracks).`}
               </p>
             </div>
           </section>
@@ -392,6 +479,35 @@ export function App() {
                 <strong>30.0s</strong> along a logarithmic scoring curve.
               </p>
             </div>
+
+            {activeProviderId === 'spotify' && (
+              <div className="strategy-selector-box">
+                <div className="strategy-label-row">
+                  <Radio size={16} />
+                  <span>Spotify Playback Strategy:</span>
+                </div>
+                <div className="strategy-buttons">
+                  <button
+                    type="button"
+                    className={`btn-chip ${
+                      spotifyStrategy === 'youtube-iframe-fallback' ? 'active' : ''
+                    }`}
+                    onClick={() => handleSpotifyStrategyChange('youtube-iframe-fallback')}
+                  >
+                    Approach 2: YouTube IFrame Match (Free & Premium)
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn-chip ${
+                      spotifyStrategy === 'web-playback-sdk' ? 'active' : ''
+                    }`}
+                    onClick={() => handleSpotifyStrategyChange('web-playback-sdk')}
+                  >
+                    Approach 1: Spotify Web Playback SDK (Premium Required)
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="mechanics-grid">
               <div className="mechanic-item">
@@ -418,15 +534,23 @@ export function App() {
                 <RefreshCw className={isLoadingLibrary ? 'spin' : ''} size={18} />
                 <span>
                   {isLoadingLibrary
-                    ? 'Syncing Liked Songs...'
+                    ? `Syncing ${activeProvider.displayName} Liked Songs...`
                     : `Sign In with ${activeProvider.displayName}`}
                 </span>
               </button>
-              <span className="env-status-hint">
-                Env check: <code>VITE_GOOGLE_CLIENT_ID</code>{' '}
-                {env.google.clientId ? '✓ Set' : '✗ Unset'} · <code>VITE_GOOGLE_API_KEY</code>{' '}
-                {env.google.apiKey ? '✓ Set' : '✗ Unset'}
-              </span>
+              {activeProviderId === 'youtube-music' ? (
+                <span className="env-status-hint">
+                  Env check: <code>VITE_GOOGLE_CLIENT_ID</code>{' '}
+                  {env.google.clientId ? '✓ Set' : '✗ Unset'} · <code>VITE_GOOGLE_API_KEY</code>{' '}
+                  {env.google.apiKey ? '✓ Set' : '✗ Unset'}
+                </span>
+              ) : (
+                <span className="env-status-hint">
+                  Env check: <code>VITE_SPOTIFY_CLIENT_ID</code>{' '}
+                  {env.spotify.clientId ? '✓ Set' : '✗ Unset'} · <code>Redirect URI</code>{' '}
+                  <code>{env.spotify.redirectUri}</code>
+                </span>
+              )}
             </div>
           </section>
         ) : view === 'summary' ? (
@@ -515,10 +639,33 @@ export function App() {
             <div className="quiz-topbar">
               <div className="round-indicator">
                 <span className="badge-round">Round #{roundHistory.length + 1}</span>
-                <span className="catalog-count">{catalog.length} Liked Tracks Cached</span>
+                <span className="catalog-count">
+                  {catalog.length} {activeProvider.displayName} Tracks Cached
+                </span>
               </div>
 
               <div className="toolbar-controls">
+                {activeProviderId === 'spotify' && (
+                  <button
+                    type="button"
+                    className="btn-chip active"
+                    onClick={() =>
+                      handleSpotifyStrategyChange(
+                        spotifyStrategy === 'youtube-iframe-fallback'
+                          ? 'web-playback-sdk'
+                          : 'youtube-iframe-fallback'
+                      )
+                    }
+                    title="Switch Spotify playback engine between YouTube IFrame Match and Spotify Web Playback SDK"
+                  >
+                    <Radio size={14} />
+                    <span>
+                      {spotifyStrategy === 'youtube-iframe-fallback'
+                        ? 'Engine: YT Match'
+                        : 'Engine: Spotify SDK'}
+                    </span>
+                  </button>
+                )}
                 <button
                   type="button"
                   className={`btn-chip ${offsetMode === 'random' ? 'active' : ''}`}
@@ -528,7 +675,9 @@ export function App() {
                   title="Toggle starting from 0:00 vs random song offset"
                 >
                   <Shuffle size={14} />
-                  <span>{offsetMode === 'zero' ? 'Start: 0:00' : `Random Offset (+${startOffsetSec}s)`}</span>
+                  <span>
+                    {offsetMode === 'zero' ? 'Start: 0:00' : `Random Offset (+${startOffsetSec}s)`}
+                  </span>
                 </button>
                 <button
                   type="button"
@@ -599,7 +748,7 @@ export function App() {
                     max={MAX_SNIPPET_SECONDS}
                     step={0.1}
                     value={snippetDurationSec}
-                    onChange={(e) => handleScrubberChange( parseFloat(e.target.value) )}
+                    onChange={(e) => handleScrubberChange(parseFloat(e.target.value))}
                     className="scrubber-range"
                     aria-label="Snippet duration in seconds"
                   />
