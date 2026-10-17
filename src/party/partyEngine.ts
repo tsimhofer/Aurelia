@@ -17,6 +17,7 @@ export interface PartyMember {
   color: string;
   provider: ProviderId;
   tracks: Track[];
+  isReady: boolean;
   isHost?: boolean;
 }
 

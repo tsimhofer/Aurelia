@@ -1,10 +1,11 @@
 import Peer, { DataConnection } from 'peerjs';
-import { ProviderId, Track } from '../providers/types';
+import { PartyMemberRef, ProviderId, Track } from '../providers/types';
 
 const PEER_PREFIX = 'aurelia-party-v1-';
 const MQTT_TOPIC_ROOT = 'aurelia/party/v3';
 const STORAGE_KEY_HOST_ROOM_CODE = 'aurelia.party.host_room_code.v1';
 const CHUNK_SIZE_TRACKS = 100;
+const CHUNK_SIZE_CATALOG = 150;
 
 const MQTT_BROKERS = [
   'wss://broker.hivemq.com:8884/mqtt',
@@ -31,12 +32,106 @@ interface PartyJoinChunkPayload {
   tracks: Track[];
 }
 
+export interface PartyReadyPayload {
+  type: 'PARTY_MEMBER_READY';
+  memberId: string;
+  name: string;
+  isReady: boolean;
+  timestampMs: number;
+}
+
+export interface PartyGuessPayload {
+  type: 'PARTY_PLAYER_GUESS';
+  guessId: string;
+  roundNumber: number;
+  memberId: string;
+  memberName: string;
+  trackId: string;
+  trackTitle: string;
+  trackArtist: string;
+  correct: boolean;
+  gaveUp?: boolean;
+  timestampMs: number;
+  elapsedSec: number;
+  snippetDurationSec: number;
+}
+
+export interface PartyCatalogItem {
+  id: string;
+  title: string;
+  artist: string;
+  artworkUrl?: string;
+}
+
+interface PartyCatalogChunkPayload {
+  type: 'PARTY_CATALOG_CHUNK';
+  syncId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  items: PartyCatalogItem[];
+}
+
+export interface PartyLeaderboardEntry {
+  memberId: string;
+  name: string;
+  color: string;
+  provider: ProviderId;
+  trackCount: number;
+  isReady: boolean;
+  isHost?: boolean;
+  totalScore: number;
+  roundStatus: 'guessing' | 'correct' | 'gave-up';
+  roundPoints: number;
+  wrongAttempts: number;
+  guessTimestampMs?: number;
+  guessElapsedSec?: number;
+  guessSnippetSec?: number;
+  lastGuessTitle?: string;
+}
+
+export interface PartyRoomStatePayload {
+  type: 'PARTY_ROOM_STATE';
+  roomCode: string;
+  updatedAtMs: number;
+  status: 'lobby' | 'playing' | 'revealed' | 'summary';
+  hostName: string;
+  sharedMatchesCount: number;
+  totalTracksCount: number;
+  roundNumber: number;
+  roundStartedAtMs: number;
+  snippetDurationSec: number;
+  maxUnlockedDurationSec: number;
+  isPlayingAudio: boolean;
+  currentTrack: {
+    id: string;
+    title: string;
+    artist: string;
+    artworkUrl?: string;
+    favoritedBy?: PartyMemberRef[];
+  } | null;
+  leaderboard: PartyLeaderboardEntry[];
+}
+
 export interface PartyAckPayload {
   type: 'PARTY_SYNC_ACK';
   roomCode: string;
   memberCount: number;
   sharedMatchesCount: number;
   totalTracksCount: number;
+}
+
+export interface HostRoomCallbacks {
+  onGuestSync: (
+    payload: PartyJoinPayload,
+    replyAck: (ack: Omit<PartyAckPayload, 'type' | 'roomCode'>) => void
+  ) => void;
+  onMemberReady?: (payload: PartyReadyPayload) => void;
+  onPlayerGuess?: (payload: PartyGuessPayload) => void;
+}
+
+export interface GuestRoomCallbacks {
+  onRoomState: (state: PartyRoomStatePayload) => void;
+  onCatalogUpdate: (catalog: PartyCatalogItem[]) => void;
 }
 
 const textEncoder = new TextEncoder();
@@ -73,7 +168,7 @@ function encodeMqttString(str: string): Uint8Array {
 function buildMqttConnect(clientId: string): Uint8Array {
   const variableHeader = new Uint8Array([
     0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, // "MQTT"
-    0x04, // Protocol level 4 (v3.1.1)
+    0x04, // v3.1.1
     0x02, // Clean session
     0x00, 0x3c, // Keep-alive 60s
   ]);
@@ -131,7 +226,6 @@ function parseMqttPackets(
     }
 
     if (!completeLength || idx + remainingLength > buffer.length) {
-      // Wait for more bytes in next WebSocket frame
       break;
     }
 
@@ -139,10 +233,8 @@ function parseMqttPackets(
     const packetEnd = idx + remainingLength;
 
     if (packetType === 2) {
-      // CONNACK
       onConnAck();
     } else if (packetType === 3 && remainingLength >= 2) {
-      // PUBLISH
       const topicLen = (buffer[packetStart] << 8) | buffer[packetStart + 1];
       const topicStart = packetStart + 2;
       const topicEnd = topicStart + topicLen;
@@ -161,6 +253,10 @@ function parseMqttPackets(
   }
 
   return buffer.subarray(offset);
+}
+
+function toMemberSlug(memberId: string): string {
+  return memberId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 28) || 'guest';
 }
 
 export function generateRoomCode(): string {
@@ -195,11 +291,20 @@ export function clearSavedHostRoomCode(): void {
 export class PartyRoomService {
   private peer: Peer | null = null;
   private connections: DataConnection[] = [];
-  private sockets: WebSocket[] = [];
+  private hostSockets: WebSocket[] = [];
+  private guestSockets: WebSocket[] = [];
+  private guestPeerConn: DataConnection | null = null;
   private pingTimerId: number | null = null;
+  private guestPingTimerId: number | null = null;
   private visibilityListener: (() => void) | null = null;
   private roomCode: string | null = null;
+  private guestRoomCode: string | null = null;
+
   private processedSyncIds = new Set<string>();
+  private processedGuessIds = new Set<string>();
+  private latestReadyTsByMember = new Map<string, number>();
+  private latestRoomStateTs = 0;
+
   private chunkAssembler = new Map<
     string,
     {
@@ -210,31 +315,34 @@ export class PartyRoomService {
       chunks: Map<number, Track[]>;
     }
   >();
-  private activeGuestSyncHandler:
-    | ((
-        payload: PartyJoinPayload,
-        replyAck: (ack: Omit<PartyAckPayload, 'type' | 'roomCode'>) => void
-      ) => void)
-    | null = null;
+
+  private catalogAssembler = new Map<
+    string,
+    {
+      totalChunks: number;
+      chunks: Map<number, PartyCatalogItem[]>;
+    }
+  >();
+
+  private hostCallbacks: HostRoomCallbacks | null = null;
+  private guestCallbacks: GuestRoomCallbacks | null = null;
+  private lastBroadcastState: PartyRoomStatePayload | null = null;
+  private lastBroadcastCatalogChunks: PartyCatalogChunkPayload[] = [];
 
   public getRoomCode(): string | null {
     return this.roomCode;
   }
 
   public async hostRoom(
-    onGuestSync: (
-      payload: PartyJoinPayload,
-      replyAck: (ack: Omit<PartyAckPayload, 'type' | 'roomCode'>) => void
-    ) => void,
-    _onError?: (err: Error) => void,
+    callbacks: HostRoomCallbacks,
     forceNewCode = false
   ): Promise<string> {
-    this.destroy(false);
+    this.destroyHost(false);
 
     const existing = !forceNewCode ? getSavedHostRoomCode() : null;
     const code = existing || generateRoomCode();
     this.roomCode = code;
-    this.activeGuestSyncHandler = onGuestSync;
+    this.hostCallbacks = callbacks;
 
     try {
       localStorage.setItem(STORAGE_KEY_HOST_ROOM_CODE, code);
@@ -242,11 +350,9 @@ export class PartyRoomService {
       // Ignore storage errors
     }
 
-    // Connect to redundant MQTT-over-WebSocket brokers + PeerJS WebRTC
     this.connectHostBrokers(code);
     this.connectHostPeer(code);
 
-    // Re-sync immediately when returning to browser tab on mobile
     this.visibilityListener = () => {
       if (document.visibilityState === 'visible' && this.roomCode) {
         this.connectHostBrokers(this.roomCode);
@@ -255,6 +361,83 @@ export class PartyRoomService {
     document.addEventListener('visibilitychange', this.visibilityListener);
 
     return code;
+  }
+
+  public broadcastRoomState(state: PartyRoomStatePayload): void {
+    this.lastBroadcastState = state;
+    const code = state.roomCode;
+    const packet = buildMqttPublish(
+      `${MQTT_TOPIC_ROOT}/${code}/state`,
+      JSON.stringify(state),
+      true
+    );
+    for (const ws of this.hostSockets) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(packet);
+        } catch {
+          // Ignore
+        }
+      }
+    }
+    for (const conn of this.connections) {
+      try {
+        conn.send(state);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  public broadcastCatalogIndex(tracks: Track[]): void {
+    if (!this.roomCode) return;
+    const code = this.roomCode;
+    const items: PartyCatalogItem[] = tracks.slice(0, 600).map((t) => ({
+      id: t.id,
+      title: t.title,
+      artist: t.artist,
+      artworkUrl: t.artworkUrl,
+    }));
+
+    const syncId = `cat-${Date.now()}`;
+    const totalChunks = Math.max(1, Math.ceil(items.length / CHUNK_SIZE_CATALOG));
+    const chunks: PartyCatalogChunkPayload[] = [];
+
+    for (let i = 0; i < totalChunks; i++) {
+      chunks.push({
+        type: 'PARTY_CATALOG_CHUNK',
+        syncId,
+        chunkIndex: i,
+        totalChunks,
+        items: items.slice(i * CHUNK_SIZE_CATALOG, (i + 1) * CHUNK_SIZE_CATALOG),
+      });
+    }
+
+    this.lastBroadcastCatalogChunks = chunks;
+
+    for (const chunk of chunks) {
+      const packet = buildMqttPublish(
+        `${MQTT_TOPIC_ROOT}/${code}/catalog/${chunk.chunkIndex}`,
+        JSON.stringify(chunk),
+        true
+      );
+      for (const ws of this.hostSockets) {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(packet);
+          } catch {
+            // Ignore
+          }
+        }
+      }
+      for (const conn of this.connections) {
+        try {
+          conn.send(chunk);
+        } catch {
+          // Ignore
+        }
+      }
+    }
   }
 
   private handleCompleteJoinPayload(
@@ -272,7 +455,7 @@ export class PartyRoomService {
     }
     this.processedSyncIds.add(dedupeKey);
 
-    this.activeGuestSyncHandler?.(data, (stats) => {
+    this.hostCallbacks?.onGuestSync(data, (stats) => {
       const ack: PartyAckPayload = {
         type: 'PARTY_SYNC_ACK',
         roomCode: code,
@@ -290,7 +473,7 @@ export class PartyRoomService {
         JSON.stringify(ack),
         false
       );
-      for (const ws of this.sockets) {
+      for (const ws of this.hostSockets) {
         if (ws.readyState === WebSocket.OPEN) {
           try {
             ws.send(ackPacket);
@@ -302,20 +485,22 @@ export class PartyRoomService {
     });
   }
 
-  private handleIncomingChunkOrSync(
-    rawObj: PartyJoinPayload | PartyJoinChunkPayload,
+  private handleHostIncomingObject(
+    rawObj: unknown,
     code: string,
     peerConn?: DataConnection
   ): void {
     if (!rawObj || typeof rawObj !== 'object') return;
+    const obj = rawObj as { type?: string };
 
-    if (rawObj.type === 'PARTY_JOIN_SYNC') {
-      this.handleCompleteJoinPayload(rawObj, code, peerConn);
+    if (obj.type === 'PARTY_JOIN_SYNC') {
+      this.handleCompleteJoinPayload(rawObj as PartyJoinPayload, code, peerConn);
       return;
     }
 
-    if (rawObj.type === 'PARTY_JOIN_CHUNK') {
-      const { syncId, memberId, name, provider, chunkIndex, totalChunks, tracks } = rawObj;
+    if (obj.type === 'PARTY_JOIN_CHUNK') {
+      const chunk = rawObj as PartyJoinChunkPayload;
+      const { syncId, memberId, name, provider, chunkIndex, totalChunks, tracks } = chunk;
       if (!syncId || !Array.isArray(tracks) || !totalChunks) return;
 
       let entry = this.chunkAssembler.get(syncId);
@@ -352,26 +537,44 @@ export class PartyRoomService {
           peerConn
         );
       }
+      return;
+    }
+
+    if (obj.type === 'PARTY_MEMBER_READY') {
+      const readyMsg = rawObj as PartyReadyPayload;
+      if (!readyMsg.memberId) return;
+      const prevTs = this.latestReadyTsByMember.get(readyMsg.memberId) ?? 0;
+      if (readyMsg.timestampMs && readyMsg.timestampMs < prevTs) return;
+      this.latestReadyTsByMember.set(readyMsg.memberId, readyMsg.timestampMs || Date.now());
+      this.hostCallbacks?.onMemberReady?.(readyMsg);
+      return;
+    }
+
+    if (obj.type === 'PARTY_PLAYER_GUESS') {
+      const guessMsg = rawObj as PartyGuessPayload;
+      if (!guessMsg.guessId || this.processedGuessIds.has(guessMsg.guessId)) return;
+      this.processedGuessIds.add(guessMsg.guessId);
+      this.hostCallbacks?.onPlayerGuess?.(guessMsg);
     }
   }
 
-  private closeSockets(): void {
+  private closeHostSockets(): void {
     if (this.pingTimerId !== null) {
       window.clearInterval(this.pingTimerId);
       this.pingTimerId = null;
     }
-    for (const ws of this.sockets) {
+    for (const ws of this.hostSockets) {
       try {
         ws.close();
       } catch {
         // Ignore
       }
     }
-    this.sockets = [];
+    this.hostSockets = [];
   }
 
   private connectHostBrokers(code: string): void {
-    this.closeSockets();
+    this.closeHostSockets();
 
     for (const brokerUrl of MQTT_BROKERS) {
       try {
@@ -390,14 +593,36 @@ export class PartyRoomService {
           recvBuf = parseMqttPackets(
             recvBuf,
             () => {
-              // Subscribing to wildcard delivers all retained member chunks immediately
               ws.send(buildMqttSubscribe(`${MQTT_TOPIC_ROOT}/${code}/members/#`, 1));
+              ws.send(buildMqttSubscribe(`${MQTT_TOPIC_ROOT}/${code}/ready/#`, 2));
+              ws.send(buildMqttSubscribe(`${MQTT_TOPIC_ROOT}/${code}/guesses/#`, 3));
+              ws.send(buildMqttSubscribe(`${MQTT_TOPIC_ROOT}/${code}/events`, 4));
+
+              // Re-publish latest state & catalog if we already have one
+              if (this.lastBroadcastState && this.lastBroadcastState.roomCode === code) {
+                ws.send(
+                  buildMqttPublish(
+                    `${MQTT_TOPIC_ROOT}/${code}/state`,
+                    JSON.stringify(this.lastBroadcastState),
+                    true
+                  )
+                );
+              }
+              for (const chunk of this.lastBroadcastCatalogChunks) {
+                ws.send(
+                  buildMqttPublish(
+                    `${MQTT_TOPIC_ROOT}/${code}/catalog/${chunk.chunkIndex}`,
+                    JSON.stringify(chunk),
+                    true
+                  )
+                );
+              }
             },
             (_topic, message) => {
               if (!message || !message.startsWith('{')) return;
               try {
-                const parsed = JSON.parse(message) as PartyJoinPayload | PartyJoinChunkPayload;
-                this.handleIncomingChunkOrSync(parsed, code);
+                const parsed = JSON.parse(message) as unknown;
+                this.handleHostIncomingObject(parsed, code);
               } catch {
                 // Ignore malformed JSON
               }
@@ -405,7 +630,7 @@ export class PartyRoomService {
           );
         };
 
-        this.sockets.push(ws);
+        this.hostSockets.push(ws);
       } catch {
         // Ignore individual broker connection error
       }
@@ -413,7 +638,7 @@ export class PartyRoomService {
 
     this.pingTimerId = window.setInterval(() => {
       const ping = new Uint8Array([0xc0, 0x00]);
-      for (const ws of this.sockets) {
+      for (const ws of this.hostSockets) {
         if (ws.readyState === WebSocket.OPEN) {
           try {
             ws.send(ping);
@@ -432,12 +657,24 @@ export class PartyRoomService {
 
       peer.on('connection', (conn) => {
         this.connections.push(conn);
+        conn.on('open', () => {
+          if (this.lastBroadcastState) {
+            try {
+              conn.send(this.lastBroadcastState);
+            } catch {
+              // Ignore
+            }
+          }
+          for (const chunk of this.lastBroadcastCatalogChunks) {
+            try {
+              conn.send(chunk);
+            } catch {
+              // Ignore
+            }
+          }
+        });
         conn.on('data', (raw) => {
-          this.handleIncomingChunkOrSync(
-            raw as PartyJoinPayload | PartyJoinChunkPayload,
-            code,
-            conn
-          );
+          this.handleHostIncomingObject(raw, code, conn);
         });
       });
 
@@ -450,26 +687,216 @@ export class PartyRoomService {
       });
 
       peer.on('error', () => {
-        // WebSocket MQTT brokers handle traffic seamlessly if PeerJS has an issue
+        // MQTT brokers handle all traffic seamlessly
       });
     } catch {
-      // Ignore PeerJS init error
+      // Ignore
     }
   }
 
   public async pollRoomNow(): Promise<void> {
     if (!this.roomCode) return;
-    // Re-trigger subscription on brokers so any retained messages are re-delivered immediately
     this.connectHostBrokers(this.roomCode);
+  }
+
+  // ==========================================================================
+  // GUEST METHODS (Remote Player Live Controller, Ready Toggle, Timestamp Guess)
+  // ==========================================================================
+
+  public connectAsGuest(roomCode: string, callbacks: GuestRoomCallbacks): void {
+    const cleanCode = roomCode.trim().toUpperCase();
+    if (!cleanCode) return;
+
+    this.guestCallbacks = callbacks;
+    if (this.guestRoomCode === cleanCode && this.guestSockets.length > 0) {
+      return;
+    }
+
+    this.closeGuestSockets();
+    this.guestRoomCode = cleanCode;
+
+    for (const brokerUrl of MQTT_BROKERS) {
+      try {
+        const ws = new WebSocket(brokerUrl, 'mqtt');
+        ws.binaryType = 'arraybuffer';
+        let recvBuf: Uint8Array = new Uint8Array(0);
+
+        ws.onopen = () => {
+          const clientId = `aurelia_gc_${cleanCode}_${Math.random().toString(36).slice(2, 7)}`;
+          ws.send(buildMqttConnect(clientId));
+        };
+
+        ws.onmessage = (evt) => {
+          if (!(evt.data instanceof ArrayBuffer)) return;
+          recvBuf = concatBytes(recvBuf, new Uint8Array(evt.data));
+          recvBuf = parseMqttPackets(
+            recvBuf,
+            () => {
+              ws.send(buildMqttSubscribe(`${MQTT_TOPIC_ROOT}/${cleanCode}/state`, 1));
+              ws.send(buildMqttSubscribe(`${MQTT_TOPIC_ROOT}/${cleanCode}/catalog/#`, 2));
+            },
+            (_topic, message) => {
+              if (!message || !message.startsWith('{')) return;
+              try {
+                const parsed = JSON.parse(message) as { type?: string };
+                this.handleGuestIncomingObject(parsed);
+              } catch {
+                // Ignore
+              }
+            }
+          );
+        };
+
+        this.guestSockets.push(ws);
+      } catch {
+        // Ignore
+      }
+    }
+
+    this.guestPingTimerId = window.setInterval(() => {
+      const ping = new Uint8Array([0xc0, 0x00]);
+      for (const ws of this.guestSockets) {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(ping);
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    }, 25000);
+  }
+
+  private handleGuestIncomingObject(obj: { type?: string }): void {
+    if (!obj || typeof obj !== 'object') return;
+
+    if (obj.type === 'PARTY_ROOM_STATE') {
+      const state = obj as PartyRoomStatePayload;
+      if (state.updatedAtMs && state.updatedAtMs < this.latestRoomStateTs) {
+        return;
+      }
+      this.latestRoomStateTs = state.updatedAtMs || Date.now();
+      this.guestCallbacks?.onRoomState(state);
+      return;
+    }
+
+    if (obj.type === 'PARTY_CATALOG_CHUNK') {
+      const chunk = obj as PartyCatalogChunkPayload;
+      if (!chunk.syncId || !Array.isArray(chunk.items) || !chunk.totalChunks) return;
+      let entry = this.catalogAssembler.get(chunk.syncId);
+      if (!entry) {
+        entry = {
+          totalChunks: chunk.totalChunks,
+          chunks: new Map<number, PartyCatalogItem[]>(),
+        };
+        this.catalogAssembler.set(chunk.syncId, entry);
+      }
+      entry.chunks.set(chunk.chunkIndex, chunk.items);
+      if (entry.chunks.size >= entry.totalChunks) {
+        const allItems: PartyCatalogItem[] = [];
+        for (let i = 0; i < entry.totalChunks; i++) {
+          const part = entry.chunks.get(i);
+          if (part) allItems.push(...part);
+        }
+        this.guestCallbacks?.onCatalogUpdate(allItems);
+      }
+    }
+  }
+
+  public sendGuestReady(
+    roomCode: string,
+    memberId: string,
+    name: string,
+    isReady: boolean
+  ): void {
+    const cleanCode = roomCode.trim().toUpperCase();
+    if (!cleanCode) return;
+
+    const payload: PartyReadyPayload = {
+      type: 'PARTY_MEMBER_READY',
+      memberId,
+      name,
+      isReady,
+      timestampMs: Date.now(),
+    };
+    const jsonStr = JSON.stringify(payload);
+    const slug = toMemberSlug(memberId);
+
+    const retainedPkt = buildMqttPublish(
+      `${MQTT_TOPIC_ROOT}/${cleanCode}/ready/${slug}`,
+      jsonStr,
+      true
+    );
+    const eventPkt = buildMqttPublish(`${MQTT_TOPIC_ROOT}/${cleanCode}/events`, jsonStr, false);
+
+    for (const ws of this.guestSockets) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(retainedPkt);
+          ws.send(eventPkt);
+        } catch {
+          // Ignore
+        }
+      }
+    }
+    if (this.guestPeerConn) {
+      try {
+        this.guestPeerConn.send(payload);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  public sendGuestGuess(roomCode: string, guess: Omit<PartyGuessPayload, 'type'>): void {
+    const cleanCode = roomCode.trim().toUpperCase();
+    if (!cleanCode) return;
+
+    const payload: PartyGuessPayload = {
+      type: 'PARTY_PLAYER_GUESS',
+      ...guess,
+    };
+    const jsonStr = JSON.stringify(payload);
+    const slug = toMemberSlug(guess.memberId);
+
+    const retainedPkt = buildMqttPublish(
+      `${MQTT_TOPIC_ROOT}/${cleanCode}/guesses/${slug}`,
+      jsonStr,
+      true
+    );
+    const eventPkt = buildMqttPublish(`${MQTT_TOPIC_ROOT}/${cleanCode}/events`, jsonStr, false);
+
+    for (const ws of this.guestSockets) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(retainedPkt);
+          ws.send(eventPkt);
+        } catch {
+          // Ignore
+        }
+      }
+    }
+    if (this.guestPeerConn) {
+      try {
+        this.guestPeerConn.send(payload);
+      } catch {
+        // Ignore
+      }
+    }
   }
 
   public async sendCatalogToHost(
     roomCode: string,
-    payload: Omit<PartyJoinPayload, 'type'>
+    payload: Omit<PartyJoinPayload, 'type'>,
+    guestCallbacks?: GuestRoomCallbacks
   ): Promise<PartyAckPayload> {
     const cleanCode = roomCode.trim().toUpperCase();
     if (!cleanCode) {
       throw new Error('Please enter the 5-character Party Room Code.');
+    }
+
+    if (guestCallbacks) {
+      this.connectAsGuest(cleanCode, guestCallbacks);
     }
 
     const compactTracks: Track[] = payload.tracks.slice(0, 500).map((t) => ({
@@ -484,7 +911,7 @@ export class PartyRoomService {
     }));
 
     const syncId = `${payload.memberId}-${Date.now()}`;
-    const memberSlug = payload.memberId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24) || 'guest';
+    const memberSlug = toMemberSlug(payload.memberId);
     const chunks: PartyJoinChunkPayload[] = [];
     const totalChunks = Math.max(1, Math.ceil(compactTracks.length / CHUNK_SIZE_TRACKS));
 
@@ -501,7 +928,6 @@ export class PartyRoomService {
       });
     }
 
-    // Publish chunks across redundant MQTT-over-WebSocket brokers + PeerJS simultaneously
     const sendViaMqttBroker = (brokerUrl: string): Promise<PartyAckPayload> =>
       new Promise<PartyAckPayload>((resolve, reject) => {
         let ws: WebSocket | null = null;
@@ -550,17 +976,13 @@ export class PartyRoomService {
             recvBuf = parseMqttPackets(
               recvBuf,
               () => {
-                // 1. Subscribe to host ACK topic
                 ws!.send(buildMqttSubscribe(`${MQTT_TOPIC_ROOT}/${cleanCode}/ack`, 1));
 
-                // 2. Publish each chunk as a retained message so the host gets it live OR on wake
                 for (const chunk of chunks) {
                   const topic = `${MQTT_TOPIC_ROOT}/${cleanCode}/members/${memberSlug}/${chunk.chunkIndex}`;
                   ws!.send(buildMqttPublish(topic, JSON.stringify(chunk), true));
                 }
 
-                // 3. If host doesn't send live ACK within 1.8s (e.g. host phone is in WhatsApp),
-                // resolve with confirmation because retained chunks are safely stored on the broker!
                 fallbackTimer = window.setTimeout(() => {
                   finish({
                     type: 'PARTY_SYNC_ACK',
@@ -569,7 +991,7 @@ export class PartyRoomService {
                     sharedMatchesCount: 0,
                     totalTracksCount: compactTracks.length,
                   });
-                }, 1800);
+                }, 1600);
               },
               (_topic, message) => {
                 if (!message || !message.startsWith('{')) return;
@@ -608,16 +1030,18 @@ export class PartyRoomService {
         guestPeer.on('open', () => {
           const conn = guestPeer.connect(`${PEER_PREFIX}${cleanCode}`, { reliable: true });
           conn.on('open', () => {
+            this.guestPeerConn = conn;
             for (const chunk of chunks) {
               conn.send(chunk);
             }
           });
           conn.on('data', (raw) => {
-            const data = raw as PartyAckPayload;
+            const data = raw as { type?: string };
             if (data && data.type === 'PARTY_SYNC_ACK') {
               window.clearTimeout(timeout);
-              setTimeout(() => guestPeer.destroy(), 400);
-              resolve(data);
+              resolve(data as PartyAckPayload);
+            } else if (data) {
+              this.handleGuestIncomingObject(data);
             }
           });
           conn.on('error', (err) => {
@@ -662,8 +1086,24 @@ export class PartyRoomService {
     });
   }
 
-  public destroy(clearSavedCode = true): void {
-    this.closeSockets();
+  private closeGuestSockets(): void {
+    if (this.guestPingTimerId !== null) {
+      window.clearInterval(this.guestPingTimerId);
+      this.guestPingTimerId = null;
+    }
+    for (const ws of this.guestSockets) {
+      try {
+        ws.close();
+      } catch {
+        // Ignore
+      }
+    }
+    this.guestSockets = [];
+    this.guestRoomCode = null;
+  }
+
+  public destroyHost(clearSavedCode = true): void {
+    this.closeHostSockets();
     if (this.visibilityListener) {
       document.removeEventListener('visibilitychange', this.visibilityListener);
       this.visibilityListener = null;
@@ -687,8 +1127,25 @@ export class PartyRoomService {
     this.roomCode = null;
     if (clearSavedCode) {
       this.processedSyncIds.clear();
+      this.processedGuessIds.clear();
+      this.latestReadyTsByMember.clear();
       this.chunkAssembler.clear();
+      this.lastBroadcastState = null;
+      this.lastBroadcastCatalogChunks = [];
       clearSavedHostRoomCode();
+    }
+  }
+
+  public destroy(clearSavedCode = true): void {
+    this.destroyHost(clearSavedCode);
+    this.closeGuestSockets();
+    if (this.guestPeerConn) {
+      try {
+        this.guestPeerConn.close();
+      } catch {
+        // Ignore
+      }
+      this.guestPeerConn = null;
     }
   }
 }
