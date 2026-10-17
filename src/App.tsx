@@ -70,7 +70,7 @@ import { YouTubeMusicProvider } from './providers/YouTubeMusicProvider';
 type ScreenView = 'quiz' | 'summary';
 type OffsetMode = 'zero' | 'random';
 type GameMode = 'youtube-music' | 'spotify' | 'party';
-type PartyLocationMode = 'local' | 'remote';
+type PartyLocationMode = 'local' | 'remote' | 'coop';
 
 const MILESTONE_SECONDS = [0.1, 0.5, 1, 2, 5, 10, 15, 30];
 const STORAGE_KEY_PARTY_MEMBERS = 'aurelia.party.members.v2';
@@ -201,7 +201,7 @@ export function App() {
     return 'youtube-music';
   });
 
-  // Party Mode Differentiation: 'local' (Same Room / 1 Device) vs 'remote' (Online Multi-Device)
+  // Party Mode Differentiation: 'local' (Same Room), 'remote' (Online Room), or 'coop' (Co-Op Shared Score)
   const [partyLocationMode, setPartyLocationMode] = useState<PartyLocationMode>(() => {
     try {
       const params = new URLSearchParams(window.location.search);
@@ -219,6 +219,12 @@ export function App() {
     }
     return 'local';
   });
+  const partyLocationModeRef = useRef<PartyLocationMode>(partyLocationMode);
+  useEffect(() => {
+    partyLocationModeRef.current = partyLocationMode;
+  }, [partyLocationMode]);
+
+  const [coopRoundWinnerName, setCoopRoundWinnerName] = useState<string | undefined>(undefined);
 
   const activeProviderId: ProviderId = gameMode === 'spotify' ? 'spotify' : 'youtube-music';
   const activeProvider: MusicProvider =
@@ -446,6 +452,11 @@ export function App() {
     () => new Set(savedSession?.usedTrackIds ?? [])
   );
 
+  const runningTotalScore = useMemo(
+    () => roundHistory.reduce((sum, r) => sum + r.pointsAwarded, 0),
+    [roundHistory]
+  );
+
   // Persist active game session
   useEffect(() => {
     try {
@@ -557,12 +568,20 @@ export function App() {
       const provider = getPlaybackProviderForTrack(incomingTrack);
       void provider.cueTrack(incomingTrack).catch(() => {});
     } else if (guestRoomState.status === 'revealed' && roundState === 'playing') {
+      const effectiveLocMode = guestRoomState.partyLocationMode ?? partyLocationMode;
+      const anyCorrect = guestRoomState.leaderboard.some((e) => e.roundStatus === 'correct');
       const myEntry = guestRoomState.leaderboard.find((e) => e.memberId === guestMemberId);
-      const nextSt = myEntry?.roundStatus === 'correct' ? 'won' : 'gave-up';
+      const nextSt =
+        effectiveLocMode === 'coop'
+          ? anyCorrect
+            ? 'won'
+            : 'gave-up'
+          : myEntry?.roundStatus === 'correct'
+            ? 'won'
+            : 'gave-up';
       roundStateRef.current = nextSt;
       setRoundState(nextSt);
-      const effectiveLocMode = guestRoomState.partyLocationMode ?? partyLocationMode;
-      if (effectiveLocMode === 'remote') {
+      if (effectiveLocMode === 'remote' || effectiveLocMode === 'coop') {
         setIsPlaying(true);
         const provider = getPlaybackProviderForTrack(incomingTrack);
         void provider.playFullTrack(incomingTrack, incomingOffset).catch(() => {
@@ -582,7 +601,7 @@ export function App() {
     stopAllPlayback,
   ]);
 
-  // Build the live PartyLeaderboardEntry[] sorted by totalScore then lowest snippet duration
+  // Build the live PartyLeaderboardEntry[] (in Co-Op mode, all players share runningTotalScore)
   const partyLeaderboard = useMemo<PartyLeaderboardEntry[]>(() => {
     const entries: PartyLeaderboardEntry[] = partyMembers.map((m) => {
       const rState = roundPlayerStates[m.id];
@@ -594,7 +613,8 @@ export function App() {
         trackCount: m.tracks.length,
         isReady: m.isReady,
         isHost: m.isHost,
-        totalScore: partyScores[m.id] ?? 0,
+        totalScore:
+          partyLocationMode === 'coop' ? runningTotalScore : (partyScores[m.id] ?? 0),
         roundStatus: rState?.roundStatus ?? 'guessing',
         roundPoints: rState?.roundPoints ?? 0,
         wrongAttempts: rState?.wrongAttempts ?? 0,
@@ -604,6 +624,10 @@ export function App() {
       };
     });
 
+    if (partyLocationMode === 'coop') {
+      return entries;
+    }
+
     return entries.sort((a, b) => {
       if (b.totalScore !== a.totalScore) return b.totalScore - a.totalScore;
       if (a.guessSnippetSec !== undefined && b.guessSnippetSec !== undefined) {
@@ -611,7 +635,7 @@ export function App() {
       }
       return 0;
     });
-  }, [partyMembers, roundPlayerStates, partyScores]);
+  }, [partyMembers, roundPlayerStates, partyScores, partyLocationMode, runningTotalScore]);
 
   // Broadcast live room state from Host to all connected Guests (only when round track is ready!)
   useEffect(() => {
@@ -625,12 +649,17 @@ export function App() {
           ? 'playing'
           : 'revealed';
 
+    const lastRoundPts = roundHistory[roundHistory.length - 1]?.pointsAwarded ?? 0;
+
     const statePayload: PartyRoomStatePayload = {
       type: 'PARTY_ROOM_STATE',
       roomCode: hostRoomCode,
       updatedAtMs: Date.now(),
       status,
       partyLocationMode,
+      sharedScore: runningTotalScore,
+      lastRoundPoints: lastRoundPts,
+      roundWinnerName: coopRoundWinnerName,
       hostName: hostName.trim() || 'Host',
       sharedMatchesCount: mergedPartyPool.sharedMatchesCount,
       totalTracksCount: mergedPartyPool.totalUniqueCount,
@@ -653,13 +682,15 @@ export function App() {
     isPreparingRound,
     isPartyLobbyOpen,
     partyLocationMode,
+    runningTotalScore,
+    coopRoundWinnerName,
     view,
     roundState,
     hostName,
     mergedPartyPool.sharedMatchesCount,
     mergedPartyPool.totalUniqueCount,
     currentRoundId,
-    roundHistory.length,
+    roundHistory,
     startOffsetSec,
     snippetDurationSec,
     maxUnlockedDurationSec,
@@ -690,6 +721,7 @@ export function App() {
     currentTrackRef.current = null;
     setCurrentTrack(null);
     setCurrentRoundId('');
+    setCoopRoundWinnerName(undefined);
     setStartOffsetSec(0);
     setSnippetDurationSec(MIN_SNIPPET_SECONDS);
     maxUnlockedRef.current = MIN_SNIPPET_SECONDS;
@@ -772,13 +804,13 @@ export function App() {
     []
   );
 
-  // Reveal the active Party round when all players finish or Host clicks Reveal
+  // Reveal the active Party round when all players finish, Co-Op team solves, or Host clicks Reveal
   const revealPartyRound = useCallback(
-    (didAnyoneWin: boolean) => {
+    (didAnyoneWin: boolean, explicitPts?: number, explicitDurSec?: number) => {
       const track = currentTrackRef.current;
       if (!track || roundStateRef.current !== 'playing') return;
 
-      const usedDur = maxUnlockedRef.current;
+      const usedDur = explicitDurSec ?? maxUnlockedRef.current;
       const nextState = didAnyoneWin ? 'won' : 'gave-up';
       roundStateRef.current = nextState;
       setRoundState(nextState);
@@ -791,10 +823,13 @@ export function App() {
 
       setUsedTrackIds((prev) => new Set(prev).add(track.id));
 
-      const bestRoundPts = Math.max(
-        0,
-        ...Object.values(roundPlayerStatesRef.current).map((s) => s.roundPoints)
-      );
+      const bestRoundPts =
+        explicitPts !== undefined
+          ? explicitPts
+          : Math.max(
+              0,
+              ...Object.values(roundPlayerStatesRef.current).map((s) => s.roundPoints)
+            );
 
       setRoundHistory((prev) => [
         ...prev,
@@ -819,6 +854,7 @@ export function App() {
       const track = currentTrackRef.current;
       if (!track || roundStateRef.current !== 'playing') return;
 
+      const isCoop = partyLocationModeRef.current === 'coop';
       const currentStates = { ...roundPlayerStatesRef.current };
       const prevEntry = currentStates[guess.memberId] ?? {
         roundStatus: 'guessing',
@@ -826,7 +862,7 @@ export function App() {
         wrongAttempts: 0,
       };
 
-      if (prevEntry.roundStatus !== 'guessing') return;
+      if (!isCoop && prevEntry.roundStatus !== 'guessing') return;
 
       const isMatch =
         !guess.gaveUp &&
@@ -838,6 +874,69 @@ export function App() {
         MIN_SNIPPET_SECONDS,
         guess.snippetDurationSec || MIN_SNIPPET_SECONDS
       );
+
+      // In Co-Op mode, all players share a single team score and win/skip together!
+      if (isCoop) {
+        if (guess.gaveUp) {
+          currentStates[guess.memberId] = {
+            ...prevEntry,
+            roundStatus: 'gave-up',
+            roundPoints: 0,
+            guessTimestampMs: guess.timestampMs,
+            guessSnippetSec: playerUnlockedClipSec,
+          };
+          roundPlayerStatesRef.current = currentStates;
+          setRoundPlayerStates(currentStates);
+          revealPartyRound(false, 0, playerUnlockedClipSec);
+          return;
+        }
+
+        if (isMatch) {
+          const totalTeamWrongAttempts = Object.values(currentStates).reduce(
+            (sum, s) => sum + s.wrongAttempts,
+            0
+          );
+          const awarded = calculateNetRoundScore(playerUnlockedClipSec, totalTeamWrongAttempts);
+          currentStates[guess.memberId] = {
+            ...prevEntry,
+            roundStatus: 'correct',
+            roundPoints: awarded,
+            guessTimestampMs: guess.timestampMs,
+            guessSnippetSec: playerUnlockedClipSec,
+            lastGuessTitle: guess.trackTitle,
+          };
+          roundPlayerStatesRef.current = currentStates;
+          setRoundPlayerStates(currentStates);
+          setCoopRoundWinnerName(guess.memberName);
+          revealPartyRound(true, awarded, playerUnlockedClipSec);
+          return;
+        }
+
+        // Wrong guess in Co-Op: increment team wrong attempts, keep guessing open!
+        currentStates[guess.memberId] = {
+          ...prevEntry,
+          wrongAttempts: prevEntry.wrongAttempts + 1,
+          lastGuessTitle: guess.trackTitle,
+        };
+        roundPlayerStatesRef.current = currentStates;
+        setRoundPlayerStates(currentStates);
+
+        const hostMember =
+          partyMembersRef.current.find((m) => m.isHost) ?? partyMembersRef.current[0];
+        if (!hostMember || guess.memberId !== hostMember.id) {
+          setGuesses((prev) => [
+            ...prev,
+            {
+              trackId: guess.trackId,
+              title: `${guess.trackTitle} (${guess.memberName})`,
+              artist: guess.trackArtist,
+              snippetDurationAtGuessSec: playerUnlockedClipSec,
+              correct: false,
+            },
+          ]);
+        }
+        return;
+      }
 
       if (guess.gaveUp) {
         currentStates[guess.memberId] = {
@@ -1056,6 +1155,7 @@ export function App() {
     currentTrackRef.current = finalChosen;
     setCurrentTrack(finalChosen);
     setCurrentRoundId(nextRoundId);
+    setCoopRoundWinnerName(undefined);
     setStartOffsetSec(finalOffsetSec);
     setSnippetDurationSec(MIN_SNIPPET_SECONDS);
     maxUnlockedRef.current = MIN_SNIPPET_SECONDS;
@@ -1248,10 +1348,6 @@ export function App() {
   const effectiveScoringDuration = Math.max(snippetDurationSec, maxUnlockedDurationSec);
   const baseCurvePoints = calculateLogarithmicBaseScore(effectiveScoringDuration);
   const potentialNetPoints = calculateNetRoundScore(effectiveScoringDuration, wrongGuessesCount);
-  const runningTotalScore = useMemo(
-    () => roundHistory.reduce((sum, r) => sum + r.pointsAwarded, 0),
-    [roundHistory]
-  );
 
   const handleConnectAndSync = async (forceRefresh = false) => {
     setErrorMessage(null);
@@ -1812,11 +1908,28 @@ export function App() {
     [guestRoomState, guestMemberId]
   );
 
-  const activeOnlineStatus = isRemoteGuestPlaying
-    ? guestMyEntry?.roundStatus ?? 'guessing'
-    : isOnlinePartyHost
-      ? hostRoundStatus
-      : 'guessing';
+  const effectivePartyLocationMode: PartyLocationMode = isRemoteGuestPlaying
+    ? guestRoomState?.partyLocationMode ?? partyLocationMode
+    : partyLocationMode;
+  const isCoopParty = isPartyMode && effectivePartyLocationMode === 'coop';
+  const effectiveSharedScore = isRemoteGuestPlaying
+    ? guestRoomState?.sharedScore ?? guestMyEntry?.totalScore ?? runningTotalScore
+    : runningTotalScore;
+  const effectiveRoundWinnerName = isRemoteGuestPlaying
+    ? guestRoomState?.roundWinnerName
+    : coopRoundWinnerName;
+
+  const activeOnlineStatus = isCoopParty
+    ? roundState === 'won'
+      ? 'correct'
+      : roundState === 'gave-up'
+        ? 'gave-up'
+        : 'guessing'
+    : isRemoteGuestPlaying
+      ? guestMyEntry?.roundStatus ?? 'guessing'
+      : isOnlinePartyHost
+        ? hostRoundStatus
+        : 'guessing';
 
   const activeLeaderboard = isRemoteGuestPlaying
     ? guestRoomState?.leaderboard ?? []
@@ -1856,12 +1969,17 @@ export function App() {
                         : roundHistory.length + 1}
                   </span>
                 </div>
-                <div className="score-chip accent">
-                  <Trophy size={13} />
+                <div
+                  className="score-chip accent"
+                  title={isCoopParty ? 'Co-Op Shared Team Score' : 'Score'}
+                >
+                  {isCoopParty ? <Heart size={13} /> : <Trophy size={13} />}
                   <span className="chip-val">
-                    {isRemoteGuestPlaying
-                      ? (guestMyEntry?.totalScore ?? 0).toLocaleString()
-                      : runningTotalScore.toLocaleString()}
+                    {isCoopParty
+                      ? `Co-Op: ${effectiveSharedScore.toLocaleString()}`
+                      : isRemoteGuestPlaying
+                        ? (guestMyEntry?.totalScore ?? 0).toLocaleString()
+                        : runningTotalScore.toLocaleString()}
                   </span>
                 </div>
                 {!isRemoteGuestPlaying && roundHistory.length > 0 && (
@@ -2018,11 +2136,11 @@ export function App() {
         )}
 
         {/* ====================================================================
-            1. PARTY MODE LOBBY VIEW (Differentiates Same-Room Local vs Remote Online)
+            1. PARTY MODE LOBBY VIEW (Same Room Local, Online Remote, or Co-Op)
             ==================================================================== */}
         {isPartyMode && !isRemoteGuestPlaying && (isPartyLobbyOpen || catalog.length === 0) ? (
           <section className="surface-card party-lobby-card" aria-label="Party Mode Lobby">
-            {/* Top-Level Party Differentiation: Same Room (Local) vs Different Locations (Online) */}
+            {/* Top-Level Party Differentiation: Same Room (Local), Online Room (Remote), Co-Op (Shared Score) */}
             <div className="party-location-switcher">
               <button
                 type="button"
@@ -2032,7 +2150,7 @@ export function App() {
                 <Home size={16} />
                 <div>
                   <strong>Same Room (Local)</strong>
-                  <span>Play together in one room (1 or more devices)</span>
+                  <span>Play in one room · Individual scores</span>
                 </div>
               </button>
               <button
@@ -2043,7 +2161,18 @@ export function App() {
                 <Globe size={16} />
                 <div>
                   <strong>Online Room (Remote)</strong>
-                  <span>Join from anywhere via Room Code</span>
+                  <span>Join via Room Code · Individual scores</span>
+                </div>
+              </button>
+              <button
+                type="button"
+                className={`party-loc-btn ${partyLocationMode === 'coop' ? 'active' : ''}`}
+                onClick={() => handleSelectPartyLocationMode('coop')}
+              >
+                <Heart size={16} />
+                <div>
+                  <strong>Co-Op (Shared Score)</strong>
+                  <span>Others add music · One shared score</span>
                 </div>
               </button>
             </div>
@@ -2056,9 +2185,11 @@ export function App() {
               >
                 <Crown size={15} />
                 <span>
-                  {partyLocationMode === 'local'
-                    ? `Host Same-Room Party (${partyMembers.length})`
-                    : `Host Online Room (${partyMembers.length})`}
+                  {partyLocationMode === 'coop'
+                    ? `Host Co-Op Party (${partyMembers.length})`
+                    : partyLocationMode === 'local'
+                      ? `Host Same-Room Party (${partyMembers.length})`
+                      : `Host Online Room (${partyMembers.length})`}
                 </span>
               </button>
               <button
@@ -2076,9 +2207,11 @@ export function App() {
                 <div className="room-code-banner">
                   <div className="room-code-badge">
                     <span className="code-label">
-                      {partyLocationMode === 'local'
-                        ? 'SAME-ROOM SYNC CODE (OPTIONAL FOR SECOND DEVICES)'
-                        : 'ONLINE ROOM CODE (SHARE WITH FRIENDS)'}
+                      {partyLocationMode === 'coop'
+                        ? 'CO-OP ROOM CODE (FRIENDS CAN ALSO ADD MUSIC VIA CODE)'
+                        : partyLocationMode === 'local'
+                          ? 'SAME-ROOM SYNC CODE (OPTIONAL FOR SECOND DEVICES)'
+                          : 'ONLINE ROOM CODE (SHARE WITH FRIENDS)'}
                     </span>
                     <div className="code-value-row">
                       <span className="code-value">{hostRoomCode ?? '...'}</span>
@@ -2104,11 +2237,14 @@ export function App() {
                   </button>
                 </div>
 
-                {/* Host / Local Player Add Card */}
-                {partyLocationMode === 'local' ? (
+                {/* Host / Local / Co-Op Player Add Card */}
+                {partyLocationMode === 'local' || partyLocationMode === 'coop' ? (
                   <div className="party-add-card">
                     <span className="section-label">
-                      <UserPlus size={13} /> Add Players in This Room
+                      <UserPlus size={13} />{' '}
+                      {partyLocationMode === 'coop'
+                        ? 'Add Co-Op Players & Their Music (Shared Score)'
+                        : 'Add Players in This Room'}
                     </span>
                     <div className="party-form-row">
                       <input
@@ -2248,9 +2384,11 @@ export function App() {
                 <div className="party-roster-card">
                   <div className="roster-header">
                     <span className="section-label">
-                      {partyLocationMode === 'local'
-                        ? `Same-Room Party Roster (${partyMembers.length} Players)`
-                        : `Online Room Roster (${partyMembers.length} Joined)`}
+                      {partyLocationMode === 'coop'
+                        ? `Co-Op Team & Music Pool (${partyMembers.length} Contributors)`
+                        : partyLocationMode === 'local'
+                          ? `Same-Room Party Roster (${partyMembers.length} Players)`
+                          : `Online Room Roster (${partyMembers.length} Joined)`}
                     </span>
                     <div className="party-btn-row">
                       {partyMembers.length > 0 && !allPartyMembersReady && (
@@ -2279,9 +2417,11 @@ export function App() {
 
                   {partyMembers.length === 0 ? (
                     <p className="party-empty-hint">
-                      {partyLocationMode === 'local'
-                        ? 'Add players on this device (or have friends in the room join with the Room Code above). Mark everyone Ready to start!'
-                        : 'Set your Host Name above and connect your library, then share the Room Code so remote players can join and mark Ready!'}
+                      {partyLocationMode === 'coop'
+                        ? 'Add friends & their music libraries above (or via the Room Code). Everyone works together toward one shared Co-Op score!'
+                        : partyLocationMode === 'local'
+                          ? 'Add players on this device (or have friends in the room join with the Room Code above). Mark everyone Ready to start!'
+                          : 'Set your Host Name above and connect your library, then share the Room Code so remote players can join and mark Ready!'}
                     </p>
                   ) : (
                     <>
@@ -2345,12 +2485,14 @@ export function App() {
                           {isPreparingRound
                             ? 'Syncing First Song for All Players...'
                             : !allPartyMembersReady
-                            ? `Sync Up: Waiting for ${unreadyPartyMembersCount} player${
-                                unreadyPartyMembersCount > 1 ? 's' : ''
-                              } to Ready Up...`
-                            : `Start ${
-                                partyLocationMode === 'local' ? 'Same-Room' : 'Online'
-                              } Party Quiz (${mergedPartyPool.totalUniqueCount} Songs)`}
+                              ? `Sync Up: Waiting for ${unreadyPartyMembersCount} player${
+                                  unreadyPartyMembersCount > 1 ? 's' : ''
+                                } to Ready Up...`
+                              : partyLocationMode === 'coop'
+                                ? `Start Co-Op Quiz (${mergedPartyPool.totalUniqueCount} Songs · Shared Score)`
+                                : `Start ${
+                                    partyLocationMode === 'local' ? 'Same-Room' : 'Online'
+                                  } Party Quiz (${mergedPartyPool.totalUniqueCount} Songs)`}
                         </span>
                       </button>
                     </>
@@ -2358,7 +2500,7 @@ export function App() {
                 </div>
               </div>
             ) : (
-              /* Guest Join & Ready Lobby Tab (Works for Both Same-Room Second Devices & Remote Players) */
+              /* Guest Join & Ready Lobby Tab (Works for Co-Op, Same-Room Second Devices & Remote Players) */
               <div className="party-join-panel">
                 <p className="join-lead">
                   Enter the host&apos;s 5-character Room Code, sync your library, and tap{' '}
@@ -2449,7 +2591,8 @@ export function App() {
                           <>
                             {' '}
                             (Host: <strong>{guestRoomState.hostName}</strong> ·{' '}
-                            <strong>{guestRoomState.totalTracksCount} songs</strong>)
+                            <strong>{guestRoomState.totalTracksCount} songs</strong>
+                            {guestRoomState.partyLocationMode === 'coop' ? ' · Co-Op Shared Score' : ''})
                           </>
                         ) : null}
                       </span>
@@ -2560,7 +2703,10 @@ export function App() {
                 <span className="crest-sub">RANK</span>
               </div>
               <div className="summary-copy">
-                <span className="eyebrow">Run Complete · {roundHistory.length} Songs</span>
+                <span className="eyebrow">
+                  {isCoopParty ? 'Co-Op Run Complete' : 'Run Complete'} · {roundHistory.length}{' '}
+                  Songs
+                </span>
                 <h2>{ranking.title}</h2>
                 <p>{ranking.description}</p>
               </div>
@@ -2568,7 +2714,9 @@ export function App() {
 
             <div className="stats-grid-4">
               <div className="stat-tile">
-                <span className="tile-label">Total Score</span>
+                <span className="tile-label">
+                  {isCoopParty ? 'Shared Co-Op Score' : 'Total Score'}
+                </span>
                 <span className="tile-value accent">{runningTotalScore.toLocaleString()}</span>
               </div>
               <div className="stat-tile">
@@ -2643,7 +2791,7 @@ export function App() {
           </section>
         ) : (
           /* ==================================================================
-             4. UNIFIED ACTIVE QUIZ STAGE (Solo, Local Party, Online Host, AND Remote Guest!)
+             4. UNIFIED ACTIVE QUIZ STAGE (Solo, Local Party, Online Host, Co-Op, AND Remote Guest!)
              Every player has their own Music Player & controls snippet length!
              ================================================================== */
           <section
@@ -2658,7 +2806,27 @@ export function App() {
             {isPartyMode && (
               <div className="party-active-bar">
                 <div className="party-roster-chips">
-                  {isRemoteGuestPlaying && guestRoomState ? (
+                  {isCoopParty ? (
+                    <>
+                      <span className="party-bar-label">
+                        <Heart size={13} /> Co-Op Shared Score:{' '}
+                        <strong>{effectiveSharedScore.toLocaleString()} pts</strong> ·
+                      </span>
+                      {(isRemoteGuestPlaying ? activeLeaderboard : partyMembers).map((m) => {
+                        const id = 'memberId' in m ? m.memberId : m.id;
+                        return (
+                          <span
+                            key={id}
+                            className="fav-mini-pill"
+                            style={{ borderColor: m.color }}
+                          >
+                            <i style={{ backgroundColor: m.color }} />
+                            {m.name}
+                          </span>
+                        );
+                      })}
+                    </>
+                  ) : isRemoteGuestPlaying && guestRoomState ? (
                     <span className="party-bar-label">
                       <Globe size={13} /> Online Room <strong>{guestRoomState.roomCode}</strong> ·
                       Host: <strong>{guestRoomState.hostName}</strong>
@@ -2725,7 +2893,9 @@ export function App() {
                 {/* Status Header: Points do NOT count down with time — only change with unlocked clip length */}
                 <div className="stage-header">
                   <div className="potential-score-box">
-                    <span className="stage-eyebrow">Points at Stake</span>
+                    <span className="stage-eyebrow">
+                      {isCoopParty ? 'Co-Op Points at Stake (Shared Score)' : 'Points at Stake'}
+                    </span>
                     <div className="points-display-row">
                       <span className="points-value">{potentialNetPoints.toLocaleString()}</span>
                       <span className="points-unit">pts</span>
@@ -2831,8 +3001,9 @@ export function App() {
                   </div>
                 </div>
 
-                {/* Search & Guess Input (or Locked-In Banner in Online Party Mode) */}
-                {(isOnlinePartyHost || isRemoteGuestPlaying) &&
+                {/* Search & Guess Input (or Locked-In Banner in Competitive Online Party Mode) */}
+                {!isCoopParty &&
+                (isOnlinePartyHost || isRemoteGuestPlaying) &&
                 activeOnlineStatus === 'correct' ? (
                   <div className="guest-locked-banner correct">
                     <CheckCircle2 size={20} />
@@ -2846,7 +3017,8 @@ export function App() {
                       </span>
                     </div>
                   </div>
-                ) : (isOnlinePartyHost || isRemoteGuestPlaying) &&
+                ) : !isCoopParty &&
+                  (isOnlinePartyHost || isRemoteGuestPlaying) &&
                   activeOnlineStatus === 'gave-up' ? (
                   <div className="guest-locked-banner skipped">
                     <Flag size={18} />
@@ -2966,7 +3138,13 @@ export function App() {
                     {roundState === 'won' ? (
                       <span className="spotlight-status won">
                         <CheckCircle2 size={16} />
-                        <span>Identified at {effectiveScoringDuration.toFixed(1)}s clip!</span>
+                        <span>
+                          {isCoopParty
+                            ? effectiveRoundWinnerName
+                              ? `Co-Op: ${effectiveRoundWinnerName} identified at ${effectiveScoringDuration.toFixed(1)}s clip!`
+                              : `Co-Op Team identified at ${effectiveScoringDuration.toFixed(1)}s clip!`
+                            : `Identified at ${effectiveScoringDuration.toFixed(1)}s clip!`}
+                        </span>
                       </span>
                     ) : (
                       <span className="spotlight-status gave-up">
@@ -2977,12 +3155,17 @@ export function App() {
 
                     <span className="spotlight-points-award">
                       +
-                      {isRemoteGuestPlaying
-                        ? (guestMyEntry?.roundPoints ?? 0).toLocaleString()
-                        : (
-                            roundHistory[roundHistory.length - 1]?.pointsAwarded ?? 0
-                          ).toLocaleString()}{' '}
-                      pts
+                      {isCoopParty
+                        ? (isRemoteGuestPlaying
+                            ? (guestRoomState?.lastRoundPoints ?? 0)
+                            : (roundHistory[roundHistory.length - 1]?.pointsAwarded ?? 0)
+                          ).toLocaleString()
+                        : isRemoteGuestPlaying
+                          ? (guestMyEntry?.roundPoints ?? 0).toLocaleString()
+                          : (
+                              roundHistory[roundHistory.length - 1]?.pointsAwarded ?? 0
+                            ).toLocaleString()}{' '}
+                      pts{isCoopParty ? ' (Shared)' : ''}
                     </span>
                   </div>
 
@@ -3092,17 +3275,25 @@ export function App() {
               )
             )}
 
-            {/* Online Party Standings & Unlocked Clip Timestamps */}
+            {/* Party Standings OR Co-Op Shared Score Team Board */}
             {(isOnlinePartyHost || isRemoteGuestPlaying) && activeLeaderboard.length > 0 && (
               <div className="party-live-board">
                 <div className="attempts-header">
-                  <span>Online Party Standings</span>
-                  <span>Scored by Unlocked Clip Length</span>
+                  <span>
+                    {isCoopParty
+                      ? `Co-Op Team (${activeLeaderboard.length} Music Contributors)`
+                      : 'Party Standings'}
+                  </span>
+                  <span>
+                    {isCoopParty
+                      ? `Shared Score: ${effectiveSharedScore.toLocaleString()} pts`
+                      : 'Scored by Unlocked Clip Length'}
+                  </span>
                 </div>
                 <div className="member-list">
                   {activeLeaderboard.map((entry, idx) => (
                     <div key={entry.memberId} className="member-row">
-                      <span className="rank-num">#{idx + 1}</span>
+                      {!isCoopParty && <span className="rank-num">#{idx + 1}</span>}
                       <span
                         className="member-dot"
                         style={{ backgroundColor: entry.color }}
@@ -3112,17 +3303,23 @@ export function App() {
                           {entry.name} {entry.isHost ? '(Host)' : ''}
                         </strong>
                         <span>
-                          {entry.roundStatus === 'correct'
-                            ? `✓ @${entry.guessSnippetSec?.toFixed(1)}s clip (+${entry.roundPoints.toLocaleString()})`
-                            : entry.roundStatus === 'gave-up'
-                              ? 'Skipped'
-                              : entry.wrongAttempts > 0
-                                ? `Guessing (${entry.wrongAttempts} wrong)`
-                                : 'Guessing...'}
+                          {isCoopParty
+                            ? entry.roundStatus === 'correct'
+                              ? `✓ Solved @${entry.guessSnippetSec?.toFixed(1)}s (+${entry.roundPoints.toLocaleString()} shared pts)`
+                              : `${entry.trackCount} songs in Co-Op pool`
+                            : entry.roundStatus === 'correct'
+                              ? `✓ @${entry.guessSnippetSec?.toFixed(1)}s clip (+${entry.roundPoints.toLocaleString()})`
+                              : entry.roundStatus === 'gave-up'
+                                ? 'Skipped'
+                                : entry.wrongAttempts > 0
+                                  ? `Guessing (${entry.wrongAttempts} wrong)`
+                                  : 'Guessing...'}
                         </span>
                       </div>
                       <span className="board-total-pts">
-                        {entry.totalScore.toLocaleString()} pts
+                        {isCoopParty
+                          ? `${entry.trackCount} songs`
+                          : `${entry.totalScore.toLocaleString()} pts`}
                       </span>
                     </div>
                   ))}
@@ -3134,7 +3331,7 @@ export function App() {
             {guesses.length > 0 && (
               <div className="attempts-section">
                 <div className="attempts-header">
-                  <span>Your Attempts ({guesses.length})</span>
+                  <span>{isCoopParty ? 'Co-Op Team Attempts' : 'Your Attempts'} ({guesses.length})</span>
                   <span>−{WRONG_GUESS_PENALTY} pts / wrong</span>
                 </div>
                 <div className="attempts-list">

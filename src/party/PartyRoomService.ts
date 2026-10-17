@@ -94,7 +94,10 @@ export interface PartyRoomStatePayload {
   roomCode: string;
   updatedAtMs: number;
   status: 'lobby' | 'playing' | 'revealed' | 'summary';
-  partyLocationMode?: 'local' | 'remote';
+  partyLocationMode?: 'local' | 'remote' | 'coop';
+  sharedScore?: number;
+  lastRoundPoints?: number;
+  roundWinnerName?: string;
   hostName: string;
   sharedMatchesCount: number;
   totalTracksCount: number;
