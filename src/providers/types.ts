@@ -1,5 +1,12 @@
 export type ProviderId = 'youtube-music' | 'spotify';
 
+export interface PartyMemberRef {
+  memberId: string;
+  name: string;
+  color: string;
+  provider: ProviderId;
+}
+
 export interface Track {
   /** Provider-specific unique ID (e.g., YouTube videoId or Spotify track ID) */
   id: string;
@@ -19,6 +26,8 @@ export interface Track {
   provider: ProviderId;
   /** Optional Spotify URI for Web Playback SDK */
   spotifyUri?: string;
+  /** Party members who have this track in their liked songs */
+  favoritedBy?: PartyMemberRef[];
 }
 
 export interface SnippetPlaybackOptions {
