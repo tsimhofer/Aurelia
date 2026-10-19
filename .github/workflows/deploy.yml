@@ -35,7 +35,7 @@ jobs:
         env:
           VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID || vars.VITE_GOOGLE_CLIENT_ID }}
           VITE_GOOGLE_API_KEY: ${{ secrets.VITE_GOOGLE_API_KEY || vars.VITE_GOOGLE_API_KEY }}
-          VITE_SPOTIFY_CLIENT_ID: ${{ secrets.VITE_SPOTIFY_CLIENT_ID || vars.VITE_SPOTIFY_CLIENT_ID }}
+          VITE_SPOTIFY_CLIENT_ID: ${{ secrets.VITE_SPOTIFY_CLIENT_ID || vars.VITE_SPOTIFY_CLIENT_ID || '522f49dc59044c329c2c16f5d87036b3' }}
           VITE_SPOTIFY_REDIRECT_URI: ${{ secrets.VITE_SPOTIFY_REDIRECT_URI || vars.VITE_SPOTIFY_REDIRECT_URI }}
         run: npm run build
 
